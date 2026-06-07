@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from aggregate_server.forwarder import ForwardError, ForwardResult, forward_requ
 from aggregate_server.registry import BackendEntry, BackendRegistry
 
 if TYPE_CHECKING:
-    from aggregate_server.log_writer import LogRecord, LogWriter
+    from aggregate_server.log_writer import LogWriter
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +138,8 @@ class Dispatcher:
         backend_ms = (complete_at - dispatch_at) * 1000
         usage: dict[str, Any] = {}
         if result.response is not None:
-            try:
+            with contextlib.suppress(Exception):
                 usage = result.response.json().get("usage", {})
-            except Exception:
-                pass
         self._log_writer.enqueue(LogRecord(  # type: ignore[union-attr]
             request_id=pending.request_id,
             timestamp=pending.timestamp,

@@ -4,6 +4,8 @@ from __future__ import annotations
 import altair as alt
 import pandas as pd
 
+_ROLLING_WINDOW = 3
+
 
 def _hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -14,11 +16,11 @@ def _hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
         .sum()
         .reset_index()
     )
-    hourly["rolling"] = hourly["count"].rolling(3, min_periods=1).mean()
+    hourly["rolling"] = hourly["count"].rolling(_ROLLING_WINDOW, min_periods=1).mean()
     return hourly
 
 
-def request_count_chart(df: pd.DataFrame) -> alt.LayerChart:
+def request_count_chart(df: pd.DataFrame) -> alt.Chart:
     hourly = _hourly_counts(df)
     base = alt.Chart(hourly).encode(x=alt.X("datetime:T", title="Hour"))
     bars = base.mark_bar(opacity=0.4, color="#4c78a8").encode(
@@ -27,7 +29,7 @@ def request_count_chart(df: pd.DataFrame) -> alt.LayerChart:
     line = base.mark_line(color="red", strokeWidth=2).encode(
         y=alt.Y("rolling:Q", title="3h rolling mean")
     )
-    return (bars + line).properties(height=250)
+    return alt.layer(bars, line).properties(height=250)  # type: ignore[return-value]
 
 
 def token_chart(df: pd.DataFrame) -> alt.Chart:
@@ -43,7 +45,7 @@ def token_chart(df: pd.DataFrame) -> alt.Chart:
         hourly["type"] = label
         frames.append(hourly)
     combined = pd.concat(frames, ignore_index=True)
-    return (
+    return (  # type: ignore[no-any-return]
         alt.Chart(combined)
         .mark_line(strokeWidth=2)
         .encode(
@@ -55,13 +57,13 @@ def token_chart(df: pd.DataFrame) -> alt.Chart:
     )
 
 
-def error_rate_chart(df: pd.DataFrame) -> alt.LayerChart:
+def error_rate_chart(df: pd.DataFrame) -> alt.Chart:
     df = df.copy()
     df["is_error"] = (df["status_code"] >= 400).astype(int)
     grp = df.set_index("datetime").resample("1h")["is_error"]
     hourly = pd.DataFrame({"total": grp.count(), "errors": grp.sum()}).reset_index()
     hourly["error_rate"] = hourly["errors"] / hourly["total"].clip(lower=1)
-    hourly["rolling"] = hourly["error_rate"].rolling(3, min_periods=1).mean()
+    hourly["rolling"] = hourly["error_rate"].rolling(_ROLLING_WINDOW, min_periods=1).mean()
     base = alt.Chart(hourly).encode(x=alt.X("datetime:T", title="Hour"))
     bars = base.mark_bar(opacity=0.4, color="#e45756").encode(
         y=alt.Y("error_rate:Q", title="Error rate", axis=alt.Axis(format=".0%"))
@@ -69,4 +71,4 @@ def error_rate_chart(df: pd.DataFrame) -> alt.LayerChart:
     line = base.mark_line(color="darkred", strokeWidth=2).encode(
         y=alt.Y("rolling:Q")
     )
-    return (bars + line).properties(height=250)
+    return alt.layer(bars, line).properties(height=250)  # type: ignore[return-value]

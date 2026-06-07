@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
 
 import httpx
 import pytest
@@ -11,7 +10,7 @@ import respx
 
 from aggregate_server.config import AppConfig
 from aggregate_server.dispatcher import Dispatcher, PendingRequest
-from aggregate_server.forwarder import ForwardResult
+from aggregate_server.forwarder import ForwardError, ForwardResult
 from aggregate_server.log_writer import LogRecord, LogWriter
 from aggregate_server.registry import BackendRegistry
 
@@ -99,7 +98,7 @@ async def test_log_writer_called_on_all_backends_fail(sample_config: AppConfig) 
         )
         task = asyncio.create_task(dispatcher.run_for_model("qwen3.5"))
         dispatcher.enqueue(pending)
-        with pytest.raises(Exception):
+        with pytest.raises(ForwardError):
             await asyncio.wait_for(future, timeout=3.0)
         task.cancel()
 

@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -58,7 +59,7 @@ def _emit_router_record(
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):  # type: ignore[type-arg]
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg = load_config()
     registry = BackendRegistry(cfg.backends)
     client = httpx.AsyncClient(timeout=httpx.Timeout(cfg.backend_timeout, connect=10.0))
@@ -99,8 +100,8 @@ app = FastAPI(title="Aggregate Server", version="0.1.0", lifespan=lifespan)
 @app.get("/v1/models")
 async def list_models(request: Request) -> JSONResponse:
     registry: BackendRegistry = request.app.state.registry
-    data = [ModelObject(id=m).model_dump() for m in sorted(registry.get_canonical_models())]
-    return JSONResponse(ModelsResponse(data=data).model_dump())
+    models = [ModelObject(id=m) for m in sorted(registry.get_canonical_models())]
+    return JSONResponse(ModelsResponse(data=models).model_dump())
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -168,6 +169,8 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         return _error_response(str(exc), "server_error", exc.status_code)
 
     if result.is_stream:
+        if result.stream_gen is None:
+            raise RuntimeError("Stream ForwardResult has no generator")
         return StreamingResponse(result.stream_gen, media_type="text/event-stream")
     if result.response is None:
         raise RuntimeError("Non-stream ForwardResult has no response body")
