@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +94,7 @@ class LogWriter:
             await self._write_batch(batch)
 
     def _date_str(self, timestamp: float) -> str:
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).date().isoformat()
+        return datetime.fromtimestamp(timestamp, tz=UTC).date().isoformat()
 
     async def _write_batch(self, batch: list[LogRecord]) -> None:
         by_date: dict[str, list[LogRecord]] = {}

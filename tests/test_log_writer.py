@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from aggregate_server.log_writer import LogRecord, LogWriter
 
 
-def _make_record(**kwargs) -> LogRecord:
+def _make_record(**kwargs: Any) -> LogRecord:
     defaults = dict(
         request_id="req-1",
         timestamp=1_700_000_000.0,
@@ -26,14 +29,14 @@ def _make_record(**kwargs) -> LogRecord:
     return LogRecord(**{**defaults, **kwargs})
 
 
-async def test_write_batch_creates_db_file(tmp_path):
+async def test_write_batch_creates_db_file(tmp_path: Path) -> None:
     writer = LogWriter(db_dir=tmp_path)
     await writer._write_batch([_make_record(timestamp=1_700_000_000.0)])
     db_files = list(tmp_path.glob("*.db"))
     assert len(db_files) == 1
 
 
-async def test_write_batch_record_readable(tmp_path):
+async def test_write_batch_record_readable(tmp_path: Path) -> None:
     writer = LogWriter(db_dir=tmp_path)
     rec = _make_record(request_id="abc", input_tokens=42, output_tokens=7)
     await writer._write_batch([rec])
@@ -44,8 +47,7 @@ async def test_write_batch_record_readable(tmp_path):
     assert rows == [("abc", 42, 7)]
 
 
-async def test_enqueue_drops_when_full(caplog):
-    import logging
+async def test_enqueue_drops_when_full(caplog: pytest.LogCaptureFixture) -> None:
     writer = LogWriter(queue_maxsize=1)
     writer.enqueue(_make_record(request_id="first"))
     with caplog.at_level(logging.WARNING, logger="aggregate_server.log_writer"):
@@ -54,7 +56,7 @@ async def test_enqueue_drops_when_full(caplog):
     assert "dropping" in caplog.text.lower()
 
 
-async def test_run_processes_enqueued_records(tmp_path):
+async def test_run_processes_enqueued_records(tmp_path: Path) -> None:
     writer = LogWriter(db_dir=tmp_path)
     writer.enqueue(_make_record())
     task = asyncio.create_task(writer.run())
@@ -65,7 +67,7 @@ async def test_run_processes_enqueued_records(tmp_path):
     assert len(list(tmp_path.glob("*.db"))) == 1
 
 
-async def test_run_creates_db_dir(tmp_path):
+async def test_run_creates_db_dir(tmp_path: Path) -> None:
     nested = tmp_path / "deep" / "logs"
     writer = LogWriter(db_dir=nested)
     writer.enqueue(_make_record())
@@ -77,7 +79,7 @@ async def test_run_creates_db_dir(tmp_path):
     assert nested.exists()
 
 
-async def test_write_batch_multiple_dates(tmp_path):
+async def test_write_batch_multiple_dates(tmp_path: Path) -> None:
     writer = LogWriter(db_dir=tmp_path)
     rec1 = _make_record(timestamp=1_700_000_000.0)  # 2023-11-14 UTC
     rec2 = _make_record(timestamp=1_700_100_000.0)  # 2023-11-15 UTC (27h later)
