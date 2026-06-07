@@ -169,5 +169,6 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
 
     if result.is_stream:
         return StreamingResponse(result.stream_gen, media_type="text/event-stream")
-    assert result.response is not None
+    if result.response is None:
+        raise RuntimeError("Non-stream ForwardResult has no response body")
     return JSONResponse(result.response.json(), status_code=result.response.status_code)
