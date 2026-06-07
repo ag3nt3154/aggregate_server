@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -21,7 +21,7 @@ def load_data(db_dir: str | Path, days: int = 30) -> pd.DataFrame:
     Silently skips missing days and unreadable files.
     """
     db_dir = Path(db_dir)
-    today = datetime.now(tz=timezone.utc).date()
+    today = datetime.now(tz=UTC).date()
     frames: list[pd.DataFrame] = []
 
     for offset in range(days):
