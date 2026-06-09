@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-09 (rev 10) | [README](README.md)
+> Last updated: 2026-06-09 (rev 11) | [README](README.md)
 
 ---
 
@@ -14,7 +14,7 @@ Serve multiple concurrent LLM users from a single API URL whilst tolerating fail
 
 **Non-goals:** embeddings, completions (legacy), auth on inbound requests.
 
-**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is **fully complete and verified passing**: FakeBackend, server lifecycle helpers, config writers, TestRunner (`RequestResult`, `send_wave`, `run_phase1`, `run_phase2`), Verifier (`AssertionResult`, `verify_phase1`, `verify_phase2`), stats helpers (`get_stats`, `reset_stats`, `collect_stats`), report printer (`print_report`, `_print_checks`), and main orchestration (`_start_fake_backends`, `_run_phase`, `main`) are all implemented. All 10 assertions pass; script exits 0. Run with `PYTHONIOENCODING=utf-8 python scripts/starry_karp.py` (Windows requires `PYTHONIOENCODING=utf-8` for Unicode checkmark characters in output). 63 tests pass as of 2026-06-09.
+**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is **fully complete and verified passing** with 3 phases: Phase 1 (load balancing), Phase 2 (per-model queue isolation), Phase 3 (retry + reroute via flaky backend injection). `make_fake_backend` now accepts `fail_after`, `error_latency`, and `error_code` keyword params for error injection. A 5th backend (`RETRY_BACKEND`, port 9005) runs with `fail_after=1, error_latency=5.0` to test retry/escalation paths. All 14 integration assertions pass; script exits 0. Run with `PYTHONIOENCODING=utf-8 python scripts/starry_karp.py` (Windows requires `PYTHONIOENCODING=utf-8` for Unicode checkmark characters in output). 67 unit tests pass as of 2026-06-09.
 
 ## Architecture
 
@@ -111,8 +111,8 @@ Dashboard (standalone, no aggregate_server imports):
 | `docs/superpowers/plans/2026-06-07-sqlite-logging-dashboard.md` | Full 9-task implementation plan (complete) |
 | `docs/superpowers/specs/2026-06-07-sqlite-logging-dashboard-design.md` | Design spec for logging/dashboard |
 | `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md` | Design spec for Starry Karp integration test script |
-| `scripts/starry_karp.py` | End-to-end integration test script: FakeBackend, server lifecycle, config writers, TestRunner, Verifier, stats helpers, report printer, `main()` — fully runnable |
-| `tests/test_starry_karp_verifier.py` | Unit tests for `verify_phase1` and `verify_phase2` (7 tests, TDD) |
+| `scripts/starry_karp.py` | End-to-end integration test script: 5 FakeBackends (incl. flaky retry backend), server lifecycle, config writers, TestRunner, Verifier (Phases 1–3), stats helpers, report printer, `main()` — fully runnable |
+| `tests/test_starry_karp_verifier.py` | Unit tests for `verify_phase1`, `verify_phase2`, `verify_phase3` (11 tests, TDD) |
 
 ## Encountered Errors & Solutions
 
@@ -333,6 +333,7 @@ Dashboard (standalone, no aggregate_server imports):
   that tests pass. This pattern is healthy; review findings in this session surfaced two minor but
   real issues (misleading error message for direct-canonical access; `_emit_error` logs only
   `canonical_models[0]`) that all tests passed through without catching.
+- Delivers highly detailed implementation specs as agent sub-tasks, including precise closure semantics (`_total_hits` must not be reset by `/reset`), ordering rationale (why the flaky backend is tried first), and even the expected integration test output. This level of spec detail means the implementation work is largely mechanical — the cognitive load is in understanding the spec, not inventing the solution.
 
 ### Project Shortcomings
 
@@ -378,6 +379,9 @@ Dashboard (standalone, no aggregate_server imports):
 - **Dashboard is complete but untested with real data**: all tests pass against mock/in-memory
   data. The dashboard has never been run against a live `./data/logs/` directory — first real use
   may surface edge cases in the Altair timezone handling or resampling.
+- **Phase 3 flaky backend shows 3 hits in `/stats`, not 2**: hit #1 is the startup probe (returns 200), hits #2 and #3 are the 2 retry attempts (return 500 after 5s). After `reset_stats` clears `requests_log` but not `_total_hits`, the log re-accumulates from zero — so `/stats` reports `hit_count: 3` for the flaky backend after Phase 3. The verifier checks `flaky_hits >= 1`, not `== 2`, so this is correct.
+- **`fail_after` error injection in `make_fake_backend`**: the `_total_hits` closure counter is intentionally never reset by the `/reset` endpoint. This ensures the startup health probe's hit (request #1) consumes the `fail_after=1` budget, so subsequent test requests trigger the error path. If `/reset` cleared `_total_hits`, the flaky backend would accept the first test request as if it were a fresh probe and never produce errors during the test.
+- **Flaky backend is tried first in Phase 3 due to round-robin ordering**: `backend_5` (port 9005, 0s probe latency) completes its startup probe before `backend_1` (0.5s latency), giving it a lower `last_used_at`. The registry's round-robin policy picks the backend with the lowest `last_used_at` (longest idle), so `backend_5` is always selected first for Phase 3's test request. After 2×5s retry attempts fail, the dispatcher escalates to `backend_1`.
 - **Startup health probe contaminates FakeBackend stats**: the aggregate server probes all backends
   at startup (`health.check_all(failed_only=False)`) before accepting traffic. Any in-process
   FakeBackend that records ALL `/v1/chat/completions` hits (including probes) will report inflated
@@ -477,7 +481,7 @@ Dashboard (standalone, no aggregate_server imports):
 
 ### Potential Areas of Exploration
 
-- **Run Starry Karp as a CI gate**: `scripts/starry_karp.py` is fully verified end-to-end — all 10 assertions pass, exit 0. The next step is wiring it into CI (e.g. a GitHub Actions step or a pre-push hook) so integration regressions are caught automatically. On Windows, requires `PYTHONIOENCODING=utf-8` in the environment to avoid cp1252 encoding errors on `✓`/`✗` output.
+- **Run Starry Karp as a CI gate**: `scripts/starry_karp.py` is fully verified end-to-end — all 14 assertions pass across 3 phases (load balancing, queue isolation, retry/reroute), exit 0. The next step is wiring it into CI (e.g. a GitHub Actions step or a pre-push hook) so integration regressions are caught automatically. On Windows, requires `PYTHONIOENCODING=utf-8` in the environment to avoid cp1252 encoding errors on `✓`/`✗` output.
 - **Index SQLite tables**: add `CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)`
   after table creation to keep dashboard queries fast as data grows.
 - **Non-negativity constraint on regression**: replace `np.linalg.lstsq` with
