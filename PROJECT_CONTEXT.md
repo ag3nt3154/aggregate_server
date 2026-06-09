@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-09 (rev 9) | [README](README.md)
+> Last updated: 2026-06-09 (rev 10) | [README](README.md)
 
 ---
 
@@ -14,7 +14,7 @@ Serve multiple concurrent LLM users from a single API URL whilst tolerating fail
 
 **Non-goals:** embeddings, completions (legacy), auth on inbound requests.
 
-**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is **fully complete**: FakeBackend, server lifecycle helpers, config writers, TestRunner (`RequestResult`, `send_wave`, `run_phase1`, `run_phase2`), Verifier (`AssertionResult`, `verify_phase1`, `verify_phase2`), stats helpers (`get_stats`, `reset_stats`, `collect_stats`), report printer (`print_report`, `_print_checks`), and main orchestration (`_start_fake_backends`, `_run_phase`, `main`) are all implemented. Run with `uv run python scripts/starry_karp.py`. 63 tests pass as of 2026-06-09.
+**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is **fully complete and verified passing**: FakeBackend, server lifecycle helpers, config writers, TestRunner (`RequestResult`, `send_wave`, `run_phase1`, `run_phase2`), Verifier (`AssertionResult`, `verify_phase1`, `verify_phase2`), stats helpers (`get_stats`, `reset_stats`, `collect_stats`), report printer (`print_report`, `_print_checks`), and main orchestration (`_start_fake_backends`, `_run_phase`, `main`) are all implemented. All 10 assertions pass; script exits 0. Run with `PYTHONIOENCODING=utf-8 python scripts/starry_karp.py` (Windows requires `PYTHONIOENCODING=utf-8` for Unicode checkmark characters in output). 63 tests pass as of 2026-06-09.
 
 ## Architecture
 
@@ -378,6 +378,12 @@ Dashboard (standalone, no aggregate_server imports):
 - **Dashboard is complete but untested with real data**: all tests pass against mock/in-memory
   data. The dashboard has never been run against a live `./data/logs/` directory — first real use
   may surface edge cases in the Altair timezone handling or resampling.
+- **Startup health probe contaminates FakeBackend stats**: the aggregate server probes all backends
+  at startup (`health.check_all(failed_only=False)`) before accepting traffic. Any in-process
+  FakeBackend that records ALL `/v1/chat/completions` hits (including probes) will report inflated
+  hit counts if stats are collected without first resetting after the probe completes. The Starry Karp
+  script handles this by calling `reset_stats` inside `_run_phase` after `wait_for_agg_server()`
+  returns but before test requests begin.
 - **`verify_phase1` / `verify_phase2` accept `dict[str, dict[str, object]]`**: the `stats` values
   are typed as `dict[str, object]` because that mirrors what `httpx.AsyncClient.get().json()`
   returns at runtime. Arithmetic and iteration on `object` requires `# type: ignore` suppressions
@@ -404,6 +410,25 @@ Dashboard (standalone, no aggregate_server imports):
   **Fix**: Added `[[tool.mypy.overrides]]` section with `module = ["pandas", "pandas.*",
   "streamlit_autorefresh"]` and `ignore_missing_imports = true`. Installing `pandas-stubs` would
   be a more complete alternative but adds a dev dependency.
+
+- **2026-06-09 Error**: `UnicodeEncodeError: 'charmap' codec can't encode character '✓'` when running
+  `scripts/starry_karp.py` on Windows (PowerShell / cp1252 terminal).
+  **Cause**: The `_print_checks` function prints `✓` and `✗` Unicode characters. Windows PowerShell
+  defaults to cp1252 encoding for subprocess stdout, which cannot encode these code points.
+  **Fix**: Set `PYTHONIOENCODING=utf-8` before running the script on Windows. The script itself is
+  correct; this is a Windows-only environment configuration requirement. Document in README and
+  Objective section.
+
+- **2026-06-09 Error**: Phase 1 and Phase 2 hit-count assertions failed (`got 24` instead of 20,
+  `got 12` instead of 10) despite all 200 responses.
+  **Cause**: The aggregate server performs a startup health probe of all backends before accepting
+  traffic. These probe hits were counted in `requests_log` on the FakeBackend instances. Stats were
+  collected after the test requests, so they included both probe hits and test hits. The between-phase
+  `reset_stats` only helped Phase 2's cross-phase contamination, not the probe contamination within
+  each phase.
+  **Fix**: Added a `reset_stats` call for all backends inside `_run_phase`, immediately after
+  `wait_for_agg_server()` returns (i.e. after probes complete, before test requests begin). Also
+  removed the now-redundant between-phase reset from `main()`.
 
 - **2026-06-09 Error**: ruff SIM105 in `scripts/starry_karp.py` `main()` — `try/except OSError: pass` rejected.
   **Cause**: ruff's SIM105 rule requires `contextlib.suppress(OSError)` instead of a bare `try/except/pass`.
@@ -452,7 +477,7 @@ Dashboard (standalone, no aggregate_server imports):
 
 ### Potential Areas of Exploration
 
-- **Run Starry Karp as a CI gate**: `scripts/starry_karp.py` is now fully runnable (`uv run python scripts/starry_karp.py`). The next step is wiring it into CI (e.g. a GitHub Actions step or a pre-push hook) so integration regressions are caught automatically. The script exits 0 on pass, 1 on failure — a natural CI gate.
+- **Run Starry Karp as a CI gate**: `scripts/starry_karp.py` is fully verified end-to-end — all 10 assertions pass, exit 0. The next step is wiring it into CI (e.g. a GitHub Actions step or a pre-push hook) so integration regressions are caught automatically. On Windows, requires `PYTHONIOENCODING=utf-8` in the environment to avoid cp1252 encoding errors on `✓`/`✗` output.
 - **Index SQLite tables**: add `CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)`
   after table creation to keep dashboard queries fast as data grows.
 - **Non-negativity constraint on regression**: replace `np.linalg.lstsq` with
