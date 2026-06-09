@@ -14,9 +14,10 @@ Exit codes:
 from __future__ import annotations
 
 import asyncio
-import os  # noqa: F401
-import sys  # noqa: F401
-import tempfile  # noqa: F401
+import contextlib
+import os
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import TypedDict
@@ -356,3 +357,141 @@ def verify_phase2(
         f"model-b traffic never reached backend_1/2 (b1+b2 models: {b12_models})",
     ))
     return checks
+
+
+# ── Stats helpers ─────────────────────────────────────────────────────────────
+
+
+async def get_stats(client: httpx.AsyncClient, port: int) -> dict[str, object]:
+    resp = await client.get(f"http://127.0.0.1:{port}/stats", timeout=5.0)
+    return dict(resp.json())
+
+
+async def reset_stats(client: httpx.AsyncClient, port: int) -> None:
+    await client.post(f"http://127.0.0.1:{port}/reset", timeout=5.0)
+
+
+async def collect_stats(client: httpx.AsyncClient) -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
+    for b in FAKE_BACKENDS:
+        result[b["id"]] = await get_stats(client, b["port"])
+    return result
+
+
+# ── Report ────────────────────────────────────────────────────────────────────
+
+
+def _print_checks(checks: list[AssertionResult]) -> bool:
+    all_pass = True
+    for check in checks:
+        icon = "✓" if check.passed else "✗"
+        print(f"  {icon} {check.message}")
+        if not check.passed:
+            all_pass = False
+    return all_pass
+
+
+def print_report(
+    phase1_checks: list[AssertionResult],
+    phase2_checks: list[AssertionResult],
+    phase1_stats: dict[str, dict[str, object]],
+) -> bool:
+    print("\n====== Starry Karp Integration Test ======\n")
+    print("Phase 1: Load Balancing (test-model, 4 backends)")
+    p1_pass = _print_checks(phase1_checks)
+    if p1_pass:
+        dist = " ".join(
+            f"{b['id']}={phase1_stats[b['id']]['hit_count']}" for b in FAKE_BACKENDS
+        )
+        print(f"  Hit distribution: {dist}")
+    print()
+    print("Phase 2: Queue Isolation (model-a ↔ backend_1/2, model-b ↔ backend_3/4)")
+    p2_pass = _print_checks(phase2_checks)
+    print()
+    if p1_pass and p2_pass:
+        print("All assertions passed. Fleet is battle-ready.")
+    else:
+        print("ASSERTIONS FAILED. Review the output above.")
+    return p1_pass and p2_pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+
+async def _start_fake_backends() -> list[tuple[uvicorn.Server, asyncio.Task[None]]]:
+    servers: list[tuple[uvicorn.Server, asyncio.Task[None]]] = []
+    for b in FAKE_BACKENDS:
+        app = make_fake_backend(b["id"], float(b["latency"]))
+        server, task = await start_server(app, int(b["port"]))
+        servers.append((server, task))
+    return servers
+
+
+async def _run_phase(
+    client: httpx.AsyncClient,
+    config_path: str,
+    phase: int,
+) -> tuple[list[RequestResult], dict[str, dict[str, object]], float]:
+    """Configure and start the aggregate server for the given phase, run requests."""
+    if phase == 1:
+        write_phase1_config(config_path)
+    else:
+        write_phase2_config(config_path)
+    os.environ["CONFIG_PATH"] = config_path
+
+    from aggregate_server.router import app as agg_app
+
+    print(f"Starting aggregate server (phase {phase})...")
+    agg_server, agg_task = await start_server(agg_app, AGG_PORT)
+    await wait_for_agg_server(client)
+    print(f"  Ready. Running phase {phase} requests...")
+
+    t0 = time.monotonic()
+    results = await run_phase1(client) if phase == 1 else await run_phase2(client)
+    elapsed = time.monotonic() - t0
+
+    stats = await collect_stats(client)
+    await stop_server(agg_server, agg_task)
+    return results, stats, elapsed
+
+
+async def main() -> int:
+    print("Starting fake backends...")
+    backend_servers = await _start_fake_backends()
+    print("  All 4 backends ready.\n")
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        config_path = f.name
+
+    phase1_results: list[RequestResult] = []
+    phase2_results: list[RequestResult] = []
+    phase1_stats: dict[str, dict[str, object]] = {}
+    phase2_stats: dict[str, dict[str, object]] = {}
+    elapsed = 0.0
+
+    async with httpx.AsyncClient() as client:
+        try:
+            phase1_results, phase1_stats, elapsed = await _run_phase(
+                client, config_path, phase=1
+            )
+            for b in FAKE_BACKENDS:
+                await reset_stats(client, b["port"])
+
+            phase2_results, phase2_stats, _ = await _run_phase(
+                client, config_path, phase=2
+            )
+        finally:
+            print("\nStopping fake backends...")
+            for server, task in backend_servers:
+                await stop_server(server, task)
+            with contextlib.suppress(OSError):
+                os.unlink(config_path)
+
+    p1_checks = verify_phase1(phase1_results, phase1_stats, elapsed)
+    p2_checks = verify_phase2(phase2_results, phase2_stats)
+    success = print_report(p1_checks, p2_checks, phase1_stats)
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
