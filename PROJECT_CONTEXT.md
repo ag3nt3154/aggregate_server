@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-07 (all tasks complete, clean lint/mypy) | [README](README.md)
+> Last updated: 2026-06-09 (rev 4) | [README](README.md)
 
 ---
 
@@ -12,7 +12,9 @@
 
 Serve multiple concurrent LLM users from a single API URL whilst tolerating failures among backend endpoints. Clients need no API keys; the server holds backend credentials and injects them. Each backend serves exactly one model; the server maps inbound model names to appropriate backends via config.
 
-**Non-goals:** embeddings, completions (legacy), auth on inbound requests, multi-model backends.
+**Non-goals:** embeddings, completions (legacy), auth on inbound requests.
+
+**In-progress:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer complete (Task 1); registry updated (Task 2); dispatcher updated (Task 3 — queues by model group, `PendingRequest.canonical_models: list[str]`); router adaptation pending (Tasks 4+).
 
 ## Architecture
 
@@ -25,11 +27,11 @@ Client (trusted)
 │                              │    stamps request_id/timestamp, enqueues PendingRequest,
 │                              │    awaits Future result; logs 404/503/504 via LogWriter
 └──────────┬──────────────────┘
-           │ per-model asyncio.Queue (max_queue_size → 503 if full)
+           │ per-model-group asyncio.Queue (key = sorted canonical_models joined by ","; max_queue_size → 503 if full)
            ▼
 ┌─────────────────────────────┐
-│  dispatcher.py               │  – one run_for_model() loop per canonical model
-│                              │    polls BackendRegistry for a free backend,
+│  dispatcher.py               │  – one run_for_model() loop per model group (queue key)
+│                              │    polls BackendRegistry for a free backend across group,
 │                              │    spawns _handle_request Task per request;
 │                              │    emits LogRecord on success/error (non-streaming only)
 └──────────┬──────────────────┘
@@ -43,7 +45,8 @@ Client (trusted)
            ▼
 ┌─────────────────────────────┐
 │  registry.py                 │  – BackendEntry state: FREE → BUSY → FREE/FAILED
-│  (BackendRegistry)           │    single asyncio.Lock, round-robin via last_used_at
+│  (BackendRegistry)           │    single asyncio.Lock, round-robin via last_used_at;
+│                              │    acquire_backend accepts list[str] (multi-model aware)
 └─────────────────────────────┘
 
 Background tasks (started at lifespan):
@@ -60,14 +63,18 @@ Dashboard (standalone, no aggregate_server imports):
 
 ## Process Flow
 
-1. **Startup** (`router.py` lifespan): load `config.yaml` → build `BackendRegistry` → create shared
-   `httpx.AsyncClient` → `health._check_all(failed_only=False)` probes all backends → start one
-   `dispatcher.run_for_model()` task per canonical model + hourly health task + `log_writer.run()` task.
+1. **Startup** (`router.py` lifespan): load `config.yaml` → build `BackendRegistry` → call
+   `get_model_groups(cfg, registry.get_canonical_models())` → create `Dispatcher(groups=...)` →
+   create shared `httpx.AsyncClient` → `health._check_all(failed_only=False)` probes all backends →
+   start one `dispatcher.run_for_model(queue_key)` task per model group + hourly health task +
+   `log_writer.run()` task. **NOTE: router lifespan not yet updated — pending Tasks 4+.**
 2. **Request in** (`router.py`): parse body → stamp `request_id` (UUID4) + `timestamp` (unix) +
-   `enqueue_at` (monotonic) → `resolve_model()` alias lookup → 404 if no backends (logs via LogWriter)
-   → check queue depth → 503 if full (logs) → create `asyncio.Future` → `dispatcher.enqueue(PendingRequest)`.
-3. **Dispatch** (`dispatcher.py`): `queue.get()` → poll `registry.acquire_backend()` every 0.1s →
-   backend acquired → `create_task(_handle_request(entry, pending))`.
+   `enqueue_at` (monotonic) → `resolve_model()` alias lookup (returns `list[str]`) → 404 if no backends
+   (logs via LogWriter) → check queue depth → 503 if full (logs) → create `asyncio.Future` →
+   `dispatcher.enqueue(PendingRequest(canonical_models=[...]))`. **NOTE: router not yet updated — pending Tasks 4+.**
+3. **Dispatch** (`dispatcher.py`): `queue.get()` → poll `registry.acquire_backend(canonical_models)`
+   every 0.1s (acquires any backend matching any model in the group) → backend acquired →
+   `create_task(_handle_request(entry, pending))`.
 4. **Forward** (`forwarder.py`): rewrite `body["model"]` to backend's model → inject `Authorization`
    header → `_post_once()` × 2 on failure → `ForwardResult` (stream open or full response).
 5. **Escalation** (`dispatcher._handle_request`): `ForwardError` → `release(failed=True)` → acquire
@@ -93,7 +100,7 @@ Dashboard (standalone, no aggregate_server imports):
 | `aggregate_server/forwarder.py` | httpx forwarding; model/key rewrite; 2-attempt retry |
 | `aggregate_server/health.py` | Startup + hourly backend probe; FAILED → FREE restoration |
 | `aggregate_server/router.py` | FastAPI app, lifespan wiring, `/v1/chat/completions`, `/v1/models` |
-| `aggregate_server/config.py` | YAML load + Pydantic v2 validation; `resolve_model()` alias lookup |
+| `aggregate_server/config.py` | YAML load + Pydantic v2 validation; `resolve_model()` → `list[str]`; `get_callable_models()`; `get_model_groups()` |
 | `aggregate_server/log_writer.py` | `LogRecord` dataclass + `LogWriter` (queue → daily SQLite files) |
 | `config.yaml` | Backend definitions, model aliases, timeout/queue tuning (not committed with secrets) |
 | `dashboard/data.py` | `load_data(db_dir, days)` → pd.DataFrame from daily .db files (**implemented**) |
@@ -101,8 +108,9 @@ Dashboard (standalone, no aggregate_server imports):
 | `dashboard/charts.py` | Altair chart helpers: request count, tokens, error rate (**implemented**) |
 | `dashboard/app.py` | Streamlit layout: Overview + Per Backend tabs (**implemented**) |
 | `dashboard.py` | Entry point: `streamlit run dashboard.py` (**implemented**) |
-| `docs/superpowers/plans/2026-06-07-sqlite-logging-dashboard.md` | Full 9-task implementation plan |
-| `docs/superpowers/specs/2026-06-07-sqlite-logging-dashboard-design.md` | Design spec |
+| `docs/superpowers/plans/2026-06-07-sqlite-logging-dashboard.md` | Full 9-task implementation plan (complete) |
+| `docs/superpowers/specs/2026-06-07-sqlite-logging-dashboard-design.md` | Design spec for logging/dashboard |
+| `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md` | Design spec for multi-model aliases |
 
 ## Encountered Errors & Solutions
 
@@ -162,10 +170,45 @@ Dashboard (standalone, no aggregate_server imports):
   `-> AsyncIterator[None]` to `lifespan`; fixed `ModelsResponse` call to pass `ModelObject` instances;
   added explicit `if result.stream_gen is None: raise RuntimeError(...)` guard before `StreamingResponse`.
 
+- **2026-06-09 Error**: mypy type errors in `config.py` — `resolve_model` and `get_model_groups`
+  had return-type mismatches because `model_aliases` was typed `dict[str, str | list[str]]` even
+  though `_normalise_aliases` guaranteed all values were `list[str]` at runtime.
+  **Cause**: `_normalise_aliases` ran as a `mode="after"` validator and mutated `self.model_aliases`
+  in place, but Pydantic still inferred the field type from the annotation. Mypy saw the wider
+  union throughout and reported mismatches on downstream functions that assumed `list[str]`.
+  Additionally, `tests/test_config.py` had ruff I001 (unsorted import block).
+  **Fix**: Changed field annotation to `dict[str, list[str]]`; moved string coercion into a
+  `mode="before"` `@classmethod` validator so the narrowed type is established before field
+  instantiation. Sorted the import block in `tests/test_config.py`.
+
+- **2026-06-09 Error**: `test_router.py::test_non_streaming_roundtrip` and
+  `test_alias_resolved_before_routing` started returning 404 after Task 1 config changes.
+  **Cause**: `resolve_model()` return type changed from `str` to `list[str]`. `router.py` still
+  passes the result directly to `registry.has_backends_for_model(canonical)`, which expects a `str`.
+  A `list` never matches any backend model name, so every request is treated as model-not-found.
+  **Fix**: Pending — router must be updated in Task 2 of the multi-model aliases plan to iterate
+  over the resolved list. The 2 failing tests are a known, expected breakage from the Task 1 contract
+  change and will be resolved in Task 2.
+
 ## Notable Points
 
-- **Per-model queues prevent head-of-line blocking**: a slow qwen3.5 queue does not block llama3
-  requests. One `asyncio.Queue` + one dispatcher loop exists per canonical model.
+- **`resolve_model()` returns `list[str]`**: as of 2026-06-09 (Task 1), the function returns a
+  list. `registry.acquire_backend()` accepts `list[str]` (Task 2). `Dispatcher` now queues by
+  model group using a sorted comma-joined key (Task 3). The router is NOT YET updated.
+  `test_router.py` has 3 known failures until the router is updated in a later task.
+- **`model_aliases` values are always normalised to `list[str]`**: the `_normalise_aliases`
+  `mode="before"` class-method validator coerces single-string YAML values to a one-element list
+  before field instantiation. The field annotation is `dict[str, list[str]]` — mypy can verify
+  downstream callers without suppression. Using `mode="after"` for this coercion would preserve
+  the wider `str | list[str]` annotation and cause return-type mismatches in `resolve_model` and
+  `get_model_groups`.
+- **`get_callable_models()` hides aliased canonicals**: only alias keys and un-aliased canonical
+  models appear in the public model list. Raw canonical names that are members of an alias group
+  (e.g. `qwen3.5-9b`) are filtered out so clients only call the group alias.
+- **Per-model-group queues prevent head-of-line blocking**: a slow qwen3.5 group queue does not
+  block llama3 requests. One `asyncio.Queue` + one dispatcher loop exists per model group, keyed
+  by `",".join(sorted(canonical_models))`. Un-aliased models appear as single-element groups with
+  a key equal to the model name itself.
 - **Retry exhausts all free backends**: `_handle_request` loops through every free backend for the
   model before returning 502. Worst case: `2 HTTP attempts × N backends` total requests.
 - **Streaming keeps backend BUSY for full duration**: the tracked stream wrapper holds the slot
@@ -211,11 +254,20 @@ Dashboard (standalone, no aggregate_server imports):
 
 - **Canonical model**: the model name as defined in `config.yaml` under `backends[].model`.
   This is what backends expect. Distinct from inbound model names which may be aliases.
-- **Model alias**: a mapping in `config.yaml → model_aliases` translating inbound model names
-  (e.g. `qwen3.5-chat`) to a canonical model (`qwen3.5`).
-- **PendingRequest**: the internal dataclass queued per incoming request; carries canonical model,
-  body, stream flag, `asyncio.Future`, plus `request_id`, `timestamp`, `inbound_model`,
-  `enqueue_at` for logging.
+- **Model alias**: a mapping in `config.yaml → model_aliases` translating an inbound model name
+  (e.g. `qwen3.5`) to one or more canonical model names (`[qwen3.5-9b, qwen3.5-9b-q8]`). Values
+  are always stored as `list[str]` after normalisation — single-string YAML values are coerced
+  automatically.
+- **Model group**: the set of canonical backends that share an alias. `get_model_groups()` returns
+  each group as a `list[str]`; un-aliased canonicals appear as single-element groups.
+- **Callable model**: a model name a client may legally use — either an alias key or a canonical
+  model that is not a member of any alias group. `get_callable_models()` returns this list.
+- **PendingRequest**: the internal dataclass queued per incoming request; carries
+  `canonical_models: list[str]` (the resolved model group), body, stream flag, `asyncio.Future`,
+  plus `request_id`, `timestamp`, `inbound_model`, `enqueue_at` for logging.
+- **Queue key**: the string key identifying a dispatcher queue, computed as
+  `",".join(sorted(canonical_models))`. Single-model groups produce a key equal to the model name.
+  Multi-model alias groups produce a key like `"qwen3.5-9b,qwen3.5-9b-q8"`.
 - **ForwardResult**: returned by `forwarder.forward_request()`; holds either a complete
   `httpx.Response` or an async stream generator plus an `is_stream` flag.
 - **ForwardError**: exception raised by `forwarder` after retries exhausted; carries `status_code`
@@ -253,9 +305,16 @@ Dashboard (standalone, no aggregate_server imports):
 - Task specs sometimes assume packages are already installed when they are not (Tasks 7–8 assumed
   altair/streamlit were in the venv). A future Claude session should always verify the venv contents
   before treating a missing import as a code bug.
+- Task specs are delivered as agent sub-tasks with explicit verification commands at the end.
+  This means the agent is expected to run pytest + ruff + mypy and confirm clean before committing.
+  Errors discovered at that point (as in this task) are fixed inline before the commit lands.
 - Runs full lint + mypy at the end of a large feature, not per-task. This concentrated several
   fixable errors (ruff I001, SIM105, B017; mypy arg-type, no-untyped-def) into a single Task 9
   pass. They were all straightforward to fix but produced a larger-than-expected change set at the end.
+- Implements features in strict layered plans (config → router → dispatcher → tests). Deliberately
+  accepts known test failures between tasks — as seen in Task 1 of multi-model aliases, where the
+  router breakage is expected and documented as a pending Task 2. Future sessions should not treat
+  these as bugs to fix out of scope.
 
 ### Project Shortcomings
 
@@ -268,6 +327,11 @@ Dashboard (standalone, no aggregate_server imports):
 - **Test coverage gaps**: `test_router.py` relies heavily on `patch("aggregate_server.health.check_all")`
   to skip the startup probe, which means the startup probe itself is not integration-tested. The
   streaming end-to-end path has no test beyond confirming `is_stream=True` is returned.
+- **Router has 3 known failing tests** as of 2026-06-09 (Task 3 done): `test_non_streaming_roundtrip`,
+  `test_model_not_found_returns_404`, and `test_alias_resolved_before_routing` fail because `router.py`
+  still references `canonical_models` (undefined variable — should be `canonical`) and constructs
+  `PendingRequest` with the old `canonical_model=` keyword. This is an expected mid-plan state;
+  Tasks 1–3 are complete; router update is in Tasks 4+.
 - **`_next_untried_backend` gives up early on health-restore race**: if a health check restores a
   FAILED backend between retry iterations, `_next_untried_backend` returns `None` rather than
   trying again.
@@ -291,6 +355,21 @@ Dashboard (standalone, no aggregate_server imports):
   None of these caused runtime failures (FastAPI/Pydantic absorbed them silently), which is how
   they survived through all prior tasks without being noticed. The project has now been fully
   mypy-clean since 2026-06-07.
+- **Pydantic `mode="after"` validators do not narrow field types for mypy**: mutating `self.field`
+  inside a `mode="after"` validator is invisible to mypy — the annotation remains as declared. Any
+  coercion that changes the effective type of a field (e.g. `str | list[str]` → `list[str]`) must
+  use a `mode="before"` class-method validator so the narrowed type is reflected in the annotation
+  and mypy can verify downstream callers. This pattern was applied to `model_aliases` in `config.py`
+  on 2026-06-09.
+
+- **2026-06-09 Error**: `TypeError: unhashable type: 'list'` in `Dispatcher.__init__` when building
+  the `_queues` dict after Task 3 tests were written but before the dispatcher was updated.
+  **Cause**: The old `Dispatcher.__init__` iterated `canonical_models: list[str]` and used each
+  string as a dict key. After Task 2 changed the contract to `list[list[str]]` (model groups),
+  the inner lists were used as keys, which are unhashable.
+  **Fix**: Updated `Dispatcher.__init__` to accept `canonical_model_groups: list[list[str]]` and
+  compute string keys via `_key()` (`",".join(sorted(group))`). All queue lookups and enqueue
+  operations now use the computed key rather than the raw list.
 
 ### Assumptions to Challenge
 
@@ -323,6 +402,9 @@ Dashboard (standalone, no aggregate_server imports):
 
 ### Potential Areas of Exploration
 
+- **Complete multi-model aliases plan**: Tasks 1 (config), 2 (registry), and 3 (dispatcher) are
+  done. Tasks 4+ (router adaptation, model-list filtering, integration testing) remain. The design
+  spec is at `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md`.
 - **Index SQLite tables**: add `CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)`
   after table creation to keep dashboard queries fast as data grows.
 - **Non-negativity constraint on regression**: replace `np.linalg.lstsq` with
