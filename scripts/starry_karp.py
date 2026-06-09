@@ -20,9 +20,9 @@ import tempfile  # noqa: F401
 import time
 from dataclasses import dataclass
 
-import httpx  # noqa: F401
-import uvicorn  # noqa: F401
-import yaml  # noqa: F401
+import httpx
+import uvicorn
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -109,3 +109,105 @@ def make_fake_backend(backend_id: str, latency: float) -> FastAPI:
         return JSONResponse({"status": "ok"})
 
     return app
+
+
+# ── Server lifecycle ──────────────────────────────────────────────────────────
+
+
+async def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
+    """Poll until a TCP port accepts connections or timeout is reached."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            _, writer = await asyncio.open_connection(host, port)
+            writer.close()
+            await writer.wait_closed()
+            return
+        except OSError:
+            await asyncio.sleep(0.1)
+    raise RuntimeError(f"Port {port} not ready after {timeout:.0f}s")
+
+
+async def start_server(
+    app: FastAPI, port: int
+) -> tuple[uvicorn.Server, asyncio.Task[None]]:
+    """Start a uvicorn server on the given port and wait until it accepts connections."""
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=port, log_level="error", loop="none"
+    )
+    server = uvicorn.Server(config)
+    task: asyncio.Task[None] = asyncio.create_task(server.serve())
+    await wait_for_port("127.0.0.1", port)
+    return server, task
+
+
+async def stop_server(server: uvicorn.Server, task: asyncio.Task[None]) -> None:
+    """Signal the server to exit and wait for the task to finish."""
+    server.should_exit = True
+    await task
+
+
+# ── Config writers ────────────────────────────────────────────────────────────
+
+
+def _backend_entry(backend_id: str, port: int, model: str) -> dict[str, object]:
+    return {
+        "id": backend_id,
+        "url": f"http://127.0.0.1:{port}",
+        "api_key": "test-key",
+        "model": model,
+    }
+
+
+def write_phase1_config(path: str) -> None:
+    """All 4 backends serve 'test-model'."""
+    cfg = {
+        "backends": [
+            _backend_entry(b["id"], b["port"], "test-model")
+            for b in FAKE_BACKENDS
+        ],
+        "queue_timeout": 30,
+        "backend_timeout": 60,
+        "max_queue_size": 50,
+    }
+    with open(path, "w") as f:
+        yaml.dump(cfg, f)
+
+
+def write_phase2_config(path: str) -> None:
+    """Backends 1+2 serve 'model-a', backends 3+4 serve 'model-b'."""
+    model_map: dict[str, str] = {
+        "backend_1": "model-a",
+        "backend_2": "model-a",
+        "backend_3": "model-b",
+        "backend_4": "model-b",
+    }
+    cfg = {
+        "backends": [
+            _backend_entry(b["id"], b["port"], model_map[b["id"]])
+            for b in FAKE_BACKENDS
+        ],
+        "queue_timeout": 30,
+        "backend_timeout": 60,
+        "max_queue_size": 50,
+    }
+    with open(path, "w") as f:
+        yaml.dump(cfg, f)
+
+
+async def wait_for_agg_server(
+    client: httpx.AsyncClient, timeout: float = 20.0
+) -> None:
+    """Poll /v1/models until the aggregate server returns 200."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = await client.get(
+                f"http://127.0.0.1:{AGG_PORT}/v1/models", timeout=2.0
+            )
+            if resp.status_code == 200:
+                return
+        except httpx.RequestError:
+            pass
+        await asyncio.sleep(0.2)
+    raise RuntimeError("Aggregate server did not become ready in time")
