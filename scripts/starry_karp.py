@@ -44,6 +44,7 @@ FAKE_BACKENDS: list[_BackendSpec] = [
     {"id": "backend_4", "port": 9004, "latency": 3.0},
 ]
 AGG_PORT = 8765
+RETRY_BACKEND: _BackendSpec = {"id": "backend_5", "port": 9005, "latency": 0.0}
 
 # ── FakeBackend ───────────────────────────────────────────────────────────────
 
@@ -55,16 +56,43 @@ class RequestRecord:
     responded_at: float
 
 
-def make_fake_backend(backend_id: str, latency: float) -> FastAPI:
-    """Return a FastAPI app that simulates an OpenAI-compatible backend."""
+def make_fake_backend(
+    backend_id: str,
+    latency: float,
+    *,
+    fail_after: int = 0,
+    error_latency: float = 0.0,
+    error_code: int = 500,
+) -> FastAPI:
+    """Return a FastAPI app that simulates an OpenAI-compatible backend.
+
+    Args:
+        backend_id: Unique identifier for this backend.
+        latency: Simulated response latency in seconds for successful requests.
+        fail_after: Return 200 for the first N requests, then return error_code.
+            0 means never fail (existing behavior unchanged).
+        error_latency: Seconds to sleep before returning the error response.
+        error_code: HTTP status code to return after fail_after threshold.
+    """
     app: FastAPI = FastAPI()
     requests_log: list[RequestRecord] = []
+    _total_hits = 0  # never reset by /reset — persists startup probe counts
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request) -> JSONResponse:
+        nonlocal _total_hits
         body = await request.json()
         model: str = body.get("model", "")
         received = time.monotonic()
+        _total_hits += 1
+        is_failure = fail_after > 0 and _total_hits > fail_after
+        if is_failure:
+            await asyncio.sleep(error_latency)
+            responded = time.monotonic()
+            requests_log.append(
+                RequestRecord(model=model, received_at=received, responded_at=responded)
+            )
+            return JSONResponse({"error": "injected failure"}, status_code=error_code)
         await asyncio.sleep(latency)
         responded = time.monotonic()
         requests_log.append(
@@ -188,6 +216,21 @@ def write_phase1_config(path: str) -> None:
         yaml.dump(cfg, f)
 
 
+def write_phase3_config(path: str) -> None:
+    """backend_5 (flaky) + backend_1 (healthy), both serving 'retry-model'."""
+    cfg = {
+        "backends": [
+            _backend_entry(RETRY_BACKEND["id"], int(RETRY_BACKEND["port"]), "retry-model"),
+            _backend_entry(FAKE_BACKENDS[0]["id"], int(FAKE_BACKENDS[0]["port"]), "retry-model"),
+        ],
+        "queue_timeout": 30,
+        "backend_timeout": 60,
+        "max_queue_size": 50,
+    }
+    with open(path, "w") as f:
+        yaml.dump(cfg, f)
+
+
 def write_phase2_config(path: str) -> None:
     """Backends 1+2 serve 'model-a', backends 3+4 serve 'model-b'."""
     model_map: dict[str, str] = {
@@ -264,6 +307,11 @@ async def run_phase1(client: httpx.AsyncClient) -> list[RequestResult]:
         results.extend(await send_wave(client, "test-model", 5))
         await asyncio.sleep(0.5)
     return results
+
+
+async def run_phase3(client: httpx.AsyncClient) -> list[RequestResult]:
+    """1 request to 'retry-model' — exercises retry + reroute path."""
+    return await send_wave(client, "retry-model", 1)
 
 
 async def run_phase2(client: httpx.AsyncClient) -> list[RequestResult]:
@@ -359,6 +407,35 @@ def verify_phase2(
     return checks
 
 
+def verify_phase3(
+    results: list[RequestResult],
+    stats: dict[str, dict[str, object]],
+    elapsed: float,
+) -> list[AssertionResult]:
+    """Phase 3: verify retry on flaky backend and successful reroute to healthy backend."""
+    checks: list[AssertionResult] = []
+    failed = [r.status_code for r in results if r.status_code != 200]
+    checks.append(AssertionResult(
+        not failed,
+        f"Request ultimately returned 200 after retry/reroute (got: {failed})",
+    ))
+    flaky_hits = int(stats[RETRY_BACKEND["id"]]["hit_count"])  # type: ignore[arg-type]
+    checks.append(AssertionResult(
+        flaky_hits >= 1,
+        f"Flaky backend (backend_5) was tried at least once (hits: {flaky_hits})",
+    ))
+    healthy_hits = int(stats[FAKE_BACKENDS[0]["id"]]["hit_count"])  # type: ignore[arg-type]
+    checks.append(AssertionResult(
+        healthy_hits >= 1,
+        f"Healthy backend (backend_1) handled the rerouted request (hits: {healthy_hits})",
+    ))
+    checks.append(AssertionResult(
+        elapsed > 5.0,
+        f"Elapsed {elapsed:.1f}s > 5s — confirms retry delay was incurred",
+    ))
+    return checks
+
+
 # ── Stats helpers ─────────────────────────────────────────────────────────────
 
 
@@ -371,9 +448,13 @@ async def reset_stats(client: httpx.AsyncClient, port: int) -> None:
     await client.post(f"http://127.0.0.1:{port}/reset", timeout=5.0)
 
 
-async def collect_stats(client: httpx.AsyncClient) -> dict[str, dict[str, object]]:
+async def collect_stats(
+    client: httpx.AsyncClient,
+    extra_backends: list[_BackendSpec] | None = None,
+) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {}
-    for b in FAKE_BACKENDS:
+    backends = list(FAKE_BACKENDS) + (extra_backends or [])
+    for b in backends:
         result[b["id"]] = await get_stats(client, b["port"])
     return result
 
@@ -394,6 +475,7 @@ def _print_checks(checks: list[AssertionResult]) -> bool:
 def print_report(
     phase1_checks: list[AssertionResult],
     phase2_checks: list[AssertionResult],
+    phase3_checks: list[AssertionResult],
     phase1_stats: dict[str, dict[str, object]],
 ) -> bool:
     print("\n====== Starry Karp Integration Test ======\n")
@@ -408,11 +490,14 @@ def print_report(
     print("Phase 2: Queue Isolation (model-a ↔ backend_1/2, model-b ↔ backend_3/4)")
     p2_pass = _print_checks(phase2_checks)
     print()
-    if p1_pass and p2_pass:
+    print("Phase 3: Retry & Reroute (flaky backend → healthy backend)")
+    p3_pass = _print_checks(phase3_checks)
+    print()
+    if p1_pass and p2_pass and p3_pass:
         print("All assertions passed. Fleet is battle-ready.")
     else:
         print("ASSERTIONS FAILED. Review the output above.")
-    return p1_pass and p2_pass
+    return p1_pass and p2_pass and p3_pass
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -424,6 +509,12 @@ async def _start_fake_backends() -> list[tuple[uvicorn.Server, asyncio.Task[None
         app = make_fake_backend(b["id"], float(b["latency"]))
         server, task = await start_server(app, int(b["port"]))
         servers.append((server, task))
+    retry_app = make_fake_backend(
+        RETRY_BACKEND["id"], RETRY_BACKEND["latency"],
+        fail_after=1, error_latency=5.0,
+    )
+    server, task = await start_server(retry_app, int(RETRY_BACKEND["port"]))
+    servers.append((server, task))
     return servers
 
 
@@ -435,8 +526,10 @@ async def _run_phase(
     """Configure and start the aggregate server for the given phase, run requests."""
     if phase == 1:
         write_phase1_config(config_path)
-    else:
+    elif phase == 2:
         write_phase2_config(config_path)
+    else:
+        write_phase3_config(config_path)
     os.environ["CONFIG_PATH"] = config_path
 
     from aggregate_server.router import app as agg_app
@@ -452,10 +545,16 @@ async def _run_phase(
     print(f"  Ready. Running phase {phase} requests...")
 
     t0 = time.monotonic()
-    results = await run_phase1(client) if phase == 1 else await run_phase2(client)
+    if phase == 1:
+        results = await run_phase1(client)
+    elif phase == 2:
+        results = await run_phase2(client)
+    else:
+        results = await run_phase3(client)
     elapsed = time.monotonic() - t0
 
-    stats = await collect_stats(client)
+    extra = [RETRY_BACKEND] if phase == 3 else None
+    stats = await collect_stats(client, extra_backends=extra)
     await stop_server(agg_server, agg_task)
     return results, stats, elapsed
 
@@ -464,16 +563,19 @@ async def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print("Starting fake backends...")
     backend_servers = await _start_fake_backends()
-    print("  All 4 backends ready.\n")
+    print("  All 5 backends ready.\n")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         config_path = f.name
 
     phase1_results: list[RequestResult] = []
     phase2_results: list[RequestResult] = []
+    phase3_results: list[RequestResult] = []
     phase1_stats: dict[str, dict[str, object]] = {}
     phase2_stats: dict[str, dict[str, object]] = {}
+    phase3_stats: dict[str, dict[str, object]] = {}
     elapsed = 0.0
+    phase3_elapsed = 0.0
 
     async with httpx.AsyncClient() as client:
         try:
@@ -484,6 +586,13 @@ async def main() -> int:
             phase2_results, phase2_stats, _ = await _run_phase(
                 client, config_path, phase=2
             )
+
+            for b in [*FAKE_BACKENDS, RETRY_BACKEND]:
+                await reset_stats(client, int(b["port"]))
+
+            phase3_results, phase3_stats, phase3_elapsed = await _run_phase(
+                client, config_path, phase=3
+            )
         finally:
             print("\nStopping fake backends...")
             for server, task in backend_servers:
@@ -493,7 +602,8 @@ async def main() -> int:
 
     p1_checks = verify_phase1(phase1_results, phase1_stats, elapsed)
     p2_checks = verify_phase2(phase2_results, phase2_stats)
-    success = print_report(p1_checks, p2_checks, phase1_stats)
+    p3_checks = verify_phase3(phase3_results, phase3_stats, phase3_elapsed)
+    success = print_report(p1_checks, p2_checks, p3_checks, phase1_stats)
     return 0 if success else 1
 
 

@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from scripts.starry_karp import RequestResult, verify_phase1, verify_phase2
+from scripts.starry_karp import RequestResult, verify_phase1, verify_phase2, verify_phase3
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -113,3 +113,46 @@ def test_phase2_fails_when_hit_counts_wrong() -> None:
     }
     checks = verify_phase2(results, stats)
     assert any(not c.passed for c in checks)
+
+
+# ── Phase 3 ───────────────────────────────────────────────────────────────────
+
+def test_phase3_all_pass() -> None:
+    results = [RequestResult(status_code=200, body={})]
+    stats = {
+        "backend_5": make_stats("backend_5", 2, ["retry-model", "retry-model"]),
+        "backend_1": make_stats("backend_1", 1, ["retry-model"]),
+    }
+    checks = verify_phase3(results, stats, elapsed=10.5)
+    failures = [c for c in checks if not c.passed]
+    assert failures == [], [c.message for c in failures]
+
+
+def test_phase3_fails_when_no_200() -> None:
+    results = [RequestResult(status_code=502, body={})]
+    stats = {
+        "backend_5": make_stats("backend_5", 2, ["retry-model"] * 2),
+        "backend_1": make_stats("backend_1", 0, []),
+    }
+    checks = verify_phase3(results, stats, elapsed=10.5)
+    assert any(not c.passed and "200" in c.message for c in checks)
+
+
+def test_phase3_fails_when_flaky_not_hit() -> None:
+    results = [RequestResult(status_code=200, body={})]
+    stats = {
+        "backend_5": make_stats("backend_5", 0, []),
+        "backend_1": make_stats("backend_1", 1, ["retry-model"]),
+    }
+    checks = verify_phase3(results, stats, elapsed=10.5)
+    assert any(not c.passed and "backend_5" in c.message for c in checks)
+
+
+def test_phase3_fails_when_elapsed_too_short() -> None:
+    results = [RequestResult(status_code=200, body={})]
+    stats = {
+        "backend_5": make_stats("backend_5", 2, ["retry-model"] * 2),
+        "backend_1": make_stats("backend_1", 1, ["retry-model"]),
+    }
+    checks = verify_phase3(results, stats, elapsed=3.0)
+    assert any(not c.passed and "5s" in c.message for c in checks)
