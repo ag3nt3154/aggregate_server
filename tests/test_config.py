@@ -7,8 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from aggregate_server.config import (
-    AppConfig, BackendConfig, get_callable_models, get_model_groups,
-    load_config, resolve_model,
+    AppConfig,
+    BackendConfig,
+    get_callable_models,
+    get_model_groups,
+    load_config,
+    resolve_model,
 )
 
 

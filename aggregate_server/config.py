@@ -16,10 +16,22 @@ class BackendConfig(BaseModel):
 
 class AppConfig(BaseModel):
     backends: list[BackendConfig]
-    model_aliases: dict[str, str | list[str]] = {}
+    model_aliases: dict[str, list[str]] = {}
     queue_timeout: float = 60.0
     backend_timeout: float = 300.0
     max_queue_size: int = 100
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_aliases(cls, data: object) -> object:
+        if isinstance(data, dict):
+            raw = data.get("model_aliases", {})
+            if isinstance(raw, dict):
+                data["model_aliases"] = {
+                    k: ([v] if isinstance(v, str) else list(v))
+                    for k, v in raw.items()
+                }
+        return data
 
     @model_validator(mode="after")
     def _validate_unique_ids(self) -> AppConfig:
@@ -27,14 +39,6 @@ class AppConfig(BaseModel):
         if len(ids) != len(set(ids)):
             dupes = {x for x in ids if ids.count(x) > 1}
             raise ValueError(f"Duplicate backend IDs: {dupes}")
-        return self
-
-    @model_validator(mode="after")
-    def _normalise_aliases(self) -> AppConfig:
-        self.model_aliases = {
-            k: ([v] if isinstance(v, str) else list(v))
-            for k, v in self.model_aliases.items()
-        }
         return self
 
 
