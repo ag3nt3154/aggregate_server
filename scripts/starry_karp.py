@@ -224,3 +224,52 @@ async def wait_for_agg_server(
             pass
         await asyncio.sleep(0.2)
     raise RuntimeError("Aggregate server did not become ready in time")
+
+
+# ── TestRunner ────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RequestResult:
+    status_code: int
+    body: dict[str, object]
+
+
+async def _send_one(client: httpx.AsyncClient, model: str) -> RequestResult:
+    try:
+        resp = await client.post(
+            f"http://127.0.0.1:{AGG_PORT}/v1/chat/completions",
+            json={"model": model, "messages": [{"role": "user", "content": "ping"}]},
+            timeout=60.0,
+        )
+        return RequestResult(status_code=resp.status_code, body=resp.json())
+    except Exception as exc:
+        return RequestResult(status_code=0, body={"error": str(exc)})
+
+
+async def send_wave(
+    client: httpx.AsyncClient, model: str, count: int
+) -> list[RequestResult]:
+    """Fire `count` requests concurrently, all for the same model."""
+    return list(
+        await asyncio.gather(*[_send_one(client, model) for _ in range(count)])
+    )
+
+
+async def run_phase1(client: httpx.AsyncClient) -> list[RequestResult]:
+    """4 waves of 5 requests, all targeting 'test-model'."""
+    results: list[RequestResult] = []
+    for _ in range(4):
+        results.extend(await send_wave(client, "test-model", 5))
+        await asyncio.sleep(0.5)
+    return results
+
+
+async def run_phase2(client: httpx.AsyncClient) -> list[RequestResult]:
+    """4 waves of 5 requests, alternating between 'model-a' and 'model-b'."""
+    results: list[RequestResult] = []
+    for i in range(4):
+        model = "model-a" if i % 2 == 0 else "model-b"
+        results.extend(await send_wave(client, model, 5))
+        await asyncio.sleep(0.5)
+    return results
