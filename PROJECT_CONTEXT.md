@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-09 (rev 8) | [README](README.md)
+> Last updated: 2026-06-09 (rev 9) | [README](README.md)
 
 ---
 
@@ -14,7 +14,7 @@ Serve multiple concurrent LLM users from a single API URL whilst tolerating fail
 
 **Non-goals:** embeddings, completions (legacy), auth on inbound requests.
 
-**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is complete through the Verifier stage: FakeBackend, server lifecycle helpers, config writers, TestRunner (`RequestResult`, `send_wave`, `run_phase1`, `run_phase2`), and Verifier (`AssertionResult`, `verify_phase1`, `verify_phase2`) are all implemented and unit-tested. 63 tests pass as of 2026-06-09.
+**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is **fully complete**: FakeBackend, server lifecycle helpers, config writers, TestRunner (`RequestResult`, `send_wave`, `run_phase1`, `run_phase2`), Verifier (`AssertionResult`, `verify_phase1`, `verify_phase2`), stats helpers (`get_stats`, `reset_stats`, `collect_stats`), report printer (`print_report`, `_print_checks`), and main orchestration (`_start_fake_backends`, `_run_phase`, `main`) are all implemented. Run with `uv run python scripts/starry_karp.py`. 63 tests pass as of 2026-06-09.
 
 ## Architecture
 
@@ -111,7 +111,7 @@ Dashboard (standalone, no aggregate_server imports):
 | `docs/superpowers/plans/2026-06-07-sqlite-logging-dashboard.md` | Full 9-task implementation plan (complete) |
 | `docs/superpowers/specs/2026-06-07-sqlite-logging-dashboard-design.md` | Design spec for logging/dashboard |
 | `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md` | Design spec for Starry Karp integration test script |
-| `scripts/starry_karp.py` | End-to-end integration test script: FakeBackend, server lifecycle, config writers, TestRunner, Verifier |
+| `scripts/starry_karp.py` | End-to-end integration test script: FakeBackend, server lifecycle, config writers, TestRunner, Verifier, stats helpers, report printer, `main()` — fully runnable |
 | `tests/test_starry_karp_verifier.py` | Unit tests for `verify_phase1` and `verify_phase2` (7 tests, TDD) |
 
 ## Encountered Errors & Solutions
@@ -405,6 +405,13 @@ Dashboard (standalone, no aggregate_server imports):
   "streamlit_autorefresh"]` and `ignore_missing_imports = true`. Installing `pandas-stubs` would
   be a more complete alternative but adds a dev dependency.
 
+- **2026-06-09 Error**: ruff SIM105 in `scripts/starry_karp.py` `main()` — `try/except OSError: pass` rejected.
+  **Cause**: ruff's SIM105 rule requires `contextlib.suppress(OSError)` instead of a bare `try/except/pass`.
+  The spec delivered the `os.unlink` wrapped in a `try/except/pass` block, which ruff rejects even though
+  the spec explicitly noted that `contextlib` should be imported for SIM105 patterns elsewhere.
+  **Fix**: Added `import contextlib` to the stdlib imports block and replaced the `try/except/pass` with
+  `with contextlib.suppress(OSError): os.unlink(config_path)`.
+
 - **2026-06-09 Error**: `TypeError: unhashable type: 'list'` in `Dispatcher.__init__` when building
   the `_queues` dict after Task 3 tests were written but before the dispatcher was updated.
   **Cause**: The old `Dispatcher.__init__` iterated `canonical_models: list[str]` and used each
@@ -445,12 +452,7 @@ Dashboard (standalone, no aggregate_server imports):
 
 ### Potential Areas of Exploration
 
-- **Wire Starry Karp end-to-end**: `scripts/starry_karp.py` now has all components — FakeBackend,
-  server lifecycle, config writers, TestRunner, and Verifier. What remains is a top-level `main()`
-  or `async def run()` that spins up all 5 servers (4 fake backends + aggregate_server), runs
-  `run_phase1` + `verify_phase1`, resets backends, reconfigures for Phase 2, runs `run_phase2` +
-  `verify_phase2`, and exits 0/1 based on assertion results. The design spec is at
-  `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md`.
+- **Run Starry Karp as a CI gate**: `scripts/starry_karp.py` is now fully runnable (`uv run python scripts/starry_karp.py`). The next step is wiring it into CI (e.g. a GitHub Actions step or a pre-push hook) so integration regressions are caught automatically. The script exits 0 on pass, 1 on failure — a natural CI gate.
 - **Index SQLite tables**: add `CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)`
   after table creation to keep dashboard queries fast as data grows.
 - **Non-negativity constraint on regression**: replace `np.linalg.lstsq` with
