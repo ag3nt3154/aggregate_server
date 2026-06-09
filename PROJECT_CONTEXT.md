@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-09 (rev 6) | [README](README.md)
+> Last updated: 2026-06-09 (rev 8) | [README](README.md)
 
 ---
 
@@ -14,7 +14,7 @@ Serve multiple concurrent LLM users from a single API URL whilst tolerating fail
 
 **Non-goals:** embeddings, completions (legacy), auth on inbound requests.
 
-**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. Integration test script (`scripts/starry_karp.py`) scaffolded but not yet fully wired.
+**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. All tests pass; ruff and mypy are clean. Integration test script (`scripts/starry_karp.py`) is complete through the Verifier stage: FakeBackend, server lifecycle helpers, config writers, TestRunner (`RequestResult`, `send_wave`, `run_phase1`, `run_phase2`), and Verifier (`AssertionResult`, `verify_phase1`, `verify_phase2`) are all implemented and unit-tested. 63 tests pass as of 2026-06-09.
 
 ## Architecture
 
@@ -110,7 +110,9 @@ Dashboard (standalone, no aggregate_server imports):
 | `dashboard.py` | Entry point: `streamlit run dashboard.py` (**implemented**) |
 | `docs/superpowers/plans/2026-06-07-sqlite-logging-dashboard.md` | Full 9-task implementation plan (complete) |
 | `docs/superpowers/specs/2026-06-07-sqlite-logging-dashboard-design.md` | Design spec for logging/dashboard |
-| `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md` | Design spec for multi-model aliases |
+| `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md` | Design spec for Starry Karp integration test script |
+| `scripts/starry_karp.py` | End-to-end integration test script: FakeBackend, server lifecycle, config writers, TestRunner, Verifier |
+| `tests/test_starry_karp_verifier.py` | Unit tests for `verify_phase1` and `verify_phase2` (7 tests, TDD) |
 
 ## Encountered Errors & Solutions
 
@@ -304,7 +306,9 @@ Dashboard (standalone, no aggregate_server imports):
 - Has strong CLAUDE.md global standards (function length, complexity, line length) that suggest a
   disciplined engineering background. Apply these strictly — he will notice violations.
 - Follows a strict TDD discipline as specified in the implementation plan: tests first, confirm
-  failure, implement, confirm pass. Does not skip or reorder steps.
+  failure (ImportError or assertion failure), implement, confirm pass. Does not skip or reorder
+  steps. Has now applied this pattern across multiple tasks in both the multi-model aliases and
+  Starry Karp streams.
 - Works through large multi-task plans one task at a time via subagent dispatch, rather than
   attempting everything in one shot. Each task is self-contained with explicit test + commit steps.
 - Task specs sometimes assume packages are already installed when they are not (Tasks 7–8 assumed
@@ -324,6 +328,11 @@ Dashboard (standalone, no aggregate_server imports):
   These consistently surface at least one issue not caught mid-implementation — in this session,
   mypy `import-untyped` errors for dashboard third-party deps. Expect and budget for small fixup
   work in every final verification pass.
+- Requests explicit code reviews as a final gate before merge, separate from the implementation
+  agent runs. The code review checks spec conformance, edge cases, and coding standards — not just
+  that tests pass. This pattern is healthy; review findings in this session surfaced two minor but
+  real issues (misleading error message for direct-canonical access; `_emit_error` logs only
+  `canonical_models[0]`) that all tests passed through without catching.
 
 ### Project Shortcomings
 
@@ -341,6 +350,17 @@ Dashboard (standalone, no aggregate_server imports):
   `test_multi_model_alias_routes_to_any_backend`. The `/v1/models` endpoint uses
   `get_callable_models()` rather than raw `registry.get_canonical_models()`, so aliased canonicals
   are correctly hidden from clients.
+- **Sending an aliased canonical model name directly produces a misleading 404**: if a client
+  sends `model: "qwen3.5-9b"` when that model is an alias target (not an alias key),
+  `has_backends_for_models` returns `True` (a backend exists) but the dispatcher finds no queue
+  for the single-element key `"qwen3.5-9b"` and raises `ForwardError(404, "No backends configured
+  for model 'qwen3.5-9b'")`. The 404 status is spec-correct (the model is intentionally hidden
+  from clients), but the error message is confusing — it implies no backend, when the actual reason
+  is that the model is only accessible via its alias. This is a UX issue, not a correctness bug.
+- **`_emit_error` logs only `canonical_models[0]`**: for a multi-model alias group that exhausts
+  all backends, the error `LogRecord.canonical_model` is set to the first element of the group
+  list (e.g. `"qwen3.5-9b"`) rather than the full group. This is a minor logging fidelity gap — 
+  the inbound model name is still correct, and the group can be inferred from config.
 - **`_next_untried_backend` gives up early on health-restore race**: if a health check restores a
   FAILED backend between retry iterations, `_next_untried_backend` returns `None` rather than
   trying again.
@@ -355,9 +375,14 @@ Dashboard (standalone, no aggregate_server imports):
 - **`st_autorefresh` emits a ScriptRunContext warning on bare import**: importing `dashboard.app`
   outside of `streamlit run` triggers a harmless warning from `streamlit_autorefresh`. This appears
   in import-verification commands but does not indicate a bug.
-- **Dashboard is complete but untested with real data**: all 46 tests pass against mock/in-memory
+- **Dashboard is complete but untested with real data**: all tests pass against mock/in-memory
   data. The dashboard has never been run against a live `./data/logs/` directory — first real use
   may surface edge cases in the Altair timezone handling or resampling.
+- **`verify_phase1` / `verify_phase2` accept `dict[str, dict[str, object]]`**: the `stats` values
+  are typed as `dict[str, object]` because that mirrors what `httpx.AsyncClient.get().json()`
+  returns at runtime. Arithmetic and iteration on `object` requires `# type: ignore` suppressions
+  — these are intentional and not type-safety regressions. The actual runtime values are `int` and
+  `list[dict]` respectively, guaranteed by the FakeBackend `/stats` endpoint.
 - **Several pre-existing mypy errors in router.py were never caught**: the `lifespan` function
   lacked a return type, `ModelsResponse` was constructed with `list[dict]` instead of
   `list[ModelObject]`, and `StreamingResponse` was called without a None guard on `stream_gen`.
@@ -420,9 +445,11 @@ Dashboard (standalone, no aggregate_server imports):
 
 ### Potential Areas of Exploration
 
-- **Complete multi-model aliases plan**: Tasks 1–4 are done (config, registry, dispatcher, router).
-  The remaining work is the Starry Karp integration test script (`scripts/starry_karp.py`) which
-  is scaffolded but not yet fully wired. The design spec is at
+- **Wire Starry Karp end-to-end**: `scripts/starry_karp.py` now has all components — FakeBackend,
+  server lifecycle, config writers, TestRunner, and Verifier. What remains is a top-level `main()`
+  or `async def run()` that spins up all 5 servers (4 fake backends + aggregate_server), runs
+  `run_phase1` + `verify_phase1`, resets backends, reconfigures for Phase 2, runs `run_phase2` +
+  `verify_phase2`, and exits 0/1 based on assertion results. The design spec is at
   `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md`.
 - **Index SQLite tables**: add `CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)`
   after table creation to keep dashboard queries fast as data grows.
