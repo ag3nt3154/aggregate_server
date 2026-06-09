@@ -444,6 +444,11 @@ async def _run_phase(
     print(f"Starting aggregate server (phase {phase})...")
     agg_server, agg_task = await start_server(agg_app, AGG_PORT)
     await wait_for_agg_server(client)
+
+    # Reset stats after startup probes to ensure only test-request hits are counted.
+    for b in FAKE_BACKENDS:
+        await reset_stats(client, b["port"])
+
     print(f"  Ready. Running phase {phase} requests...")
 
     t0 = time.monotonic()
@@ -474,8 +479,6 @@ async def main() -> int:
             phase1_results, phase1_stats, elapsed = await _run_phase(
                 client, config_path, phase=1
             )
-            for b in FAKE_BACKENDS:
-                await reset_stats(client, b["port"])
 
             phase2_results, phase2_stats, _ = await _run_phase(
                 client, config_path, phase=2
