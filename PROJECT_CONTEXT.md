@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-09 (rev 4) | [README](README.md)
+> Last updated: 2026-06-09 (rev 5) | [README](README.md)
 
 ---
 
@@ -14,7 +14,7 @@ Serve multiple concurrent LLM users from a single API URL whilst tolerating fail
 
 **Non-goals:** embeddings, completions (legacy), auth on inbound requests.
 
-**In-progress:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer complete (Task 1); registry updated (Task 2); dispatcher updated (Task 3 — queues by model group, `PendingRequest.canonical_models: list[str]`); router adaptation pending (Tasks 4+).
+**Completed:** multi-model aliases — one alias key may map to multiple canonical backends (e.g. `qwen3.5` → `[qwen3.5-9b, qwen3.5-9b-q8]`). Config layer (Task 1), registry (Task 2), dispatcher (Task 3), and router (Task 4) are all complete. `/v1/models` now lists alias keys + un-aliased canonicals. Integration test script (`scripts/starry_karp.py`) scaffolded but not yet fully wired.
 
 ## Architecture
 
@@ -65,13 +65,13 @@ Dashboard (standalone, no aggregate_server imports):
 
 1. **Startup** (`router.py` lifespan): load `config.yaml` → build `BackendRegistry` → call
    `get_model_groups(cfg, registry.get_canonical_models())` → create `Dispatcher(groups=...)` →
-   create shared `httpx.AsyncClient` → `health._check_all(failed_only=False)` probes all backends →
-   start one `dispatcher.run_for_model(queue_key)` task per model group + hourly health task +
-   `log_writer.run()` task. **NOTE: router lifespan not yet updated — pending Tasks 4+.**
+   create shared `httpx.AsyncClient` → `health.check_all(failed_only=False)` probes all backends →
+   start one `dispatcher.run_for_model(queue_key)` task per model group (via `dispatcher.queue_keys`) +
+   hourly health task + `log_writer.run()` task.
 2. **Request in** (`router.py`): parse body → stamp `request_id` (UUID4) + `timestamp` (unix) +
    `enqueue_at` (monotonic) → `resolve_model()` alias lookup (returns `list[str]`) → 404 if no backends
-   (logs via LogWriter) → check queue depth → 503 if full (logs) → create `asyncio.Future` →
-   `dispatcher.enqueue(PendingRequest(canonical_models=[...]))`. **NOTE: router not yet updated — pending Tasks 4+.**
+   (`get_callable_models()` used for available list; logged via LogWriter) → create `asyncio.Future` →
+   `dispatcher.enqueue(PendingRequest(canonical_models=[...]))`.
 3. **Dispatch** (`dispatcher.py`): `queue.get()` → poll `registry.acquire_backend(canonical_models)`
    every 0.1s (acquires any backend matching any model in the group) → backend acquired →
    `create_task(_handle_request(entry, pending))`.
@@ -194,8 +194,8 @@ Dashboard (standalone, no aggregate_server imports):
 
 - **`resolve_model()` returns `list[str]`**: as of 2026-06-09 (Task 1), the function returns a
   list. `registry.acquire_backend()` accepts `list[str]` (Task 2). `Dispatcher` now queues by
-  model group using a sorted comma-joined key (Task 3). The router is NOT YET updated.
-  `test_router.py` has 3 known failures until the router is updated in a later task.
+  model group using a sorted comma-joined key (Task 3). The router was updated in Task 4 —
+  `canonical_models = resolve_model(cfg, inbound_model)` is used throughout; all 56 tests pass.
 - **`model_aliases` values are always normalised to `list[str]`**: the `_normalise_aliases`
   `mode="before"` class-method validator coerces single-string YAML values to a one-element list
   before field instantiation. The field annotation is `dict[str, list[str]]` — mypy can verify
@@ -311,10 +311,10 @@ Dashboard (standalone, no aggregate_server imports):
 - Runs full lint + mypy at the end of a large feature, not per-task. This concentrated several
   fixable errors (ruff I001, SIM105, B017; mypy arg-type, no-untyped-def) into a single Task 9
   pass. They were all straightforward to fix but produced a larger-than-expected change set at the end.
-- Implements features in strict layered plans (config → router → dispatcher → tests). Deliberately
-  accepts known test failures between tasks — as seen in Task 1 of multi-model aliases, where the
-  router breakage is expected and documented as a pending Task 2. Future sessions should not treat
-  these as bugs to fix out of scope.
+- Implements features in strict layered plans (config → registry → dispatcher → router → tests).
+  Deliberately accepts known test failures between tasks and documents them explicitly in
+  PROJECT_CONTEXT.md. Future sessions should not treat mid-plan breakage as bugs to fix out of scope;
+  always check the plan stage before diagnosing failures.
 
 ### Project Shortcomings
 
@@ -327,11 +327,11 @@ Dashboard (standalone, no aggregate_server imports):
 - **Test coverage gaps**: `test_router.py` relies heavily on `patch("aggregate_server.health.check_all")`
   to skip the startup probe, which means the startup probe itself is not integration-tested. The
   streaming end-to-end path has no test beyond confirming `is_stream=True` is returned.
-- **Router has 3 known failing tests** as of 2026-06-09 (Task 3 done): `test_non_streaming_roundtrip`,
-  `test_model_not_found_returns_404`, and `test_alias_resolved_before_routing` fail because `router.py`
-  still references `canonical_models` (undefined variable — should be `canonical`) and constructs
-  `PendingRequest` with the old `canonical_model=` keyword. This is an expected mid-plan state;
-  Tasks 1–3 are complete; router update is in Tasks 4+.
+- **Router is now fully wired for multi-model aliases** (Task 4, 2026-06-09): all 5 router tests
+  pass including `test_list_models_returns_aliases_not_canonicals` and
+  `test_multi_model_alias_routes_to_any_backend`. The `/v1/models` endpoint uses
+  `get_callable_models()` rather than raw `registry.get_canonical_models()`, so aliased canonicals
+  are correctly hidden from clients.
 - **`_next_untried_backend` gives up early on health-restore race**: if a health check restores a
   FAILED backend between retry iterations, `_next_untried_backend` returns `None` rather than
   trying again.
@@ -402,9 +402,10 @@ Dashboard (standalone, no aggregate_server imports):
 
 ### Potential Areas of Exploration
 
-- **Complete multi-model aliases plan**: Tasks 1 (config), 2 (registry), and 3 (dispatcher) are
-  done. Tasks 4+ (router adaptation, model-list filtering, integration testing) remain. The design
-  spec is at `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md`.
+- **Complete multi-model aliases plan**: Tasks 1–4 are done (config, registry, dispatcher, router).
+  The remaining work is the Starry Karp integration test script (`scripts/starry_karp.py`) which
+  is scaffolded but not yet fully wired. The design spec is at
+  `docs/superpowers/specs/2026-06-09-starry-karp-test-script-design.md`.
 - **Index SQLite tables**: add `CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp)`
   after table creation to keep dashboard queries fast as data grows.
 - **Non-negativity constraint on regression**: replace `np.linalg.lstsq` with
