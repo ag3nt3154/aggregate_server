@@ -13,7 +13,13 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from aggregate_server.config import AppConfig, load_config, resolve_model
+from aggregate_server.config import (
+    AppConfig,
+    get_callable_models,
+    get_model_groups,
+    load_config,
+    resolve_model,
+)
 from aggregate_server.dispatcher import Dispatcher, PendingRequest, QueueFullError
 from aggregate_server.forwarder import ForwardError, ForwardResult
 from aggregate_server.health import check_all, run_health_checks
@@ -68,15 +74,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Probing all backends before accepting traffic...")
     await check_all(registry, client, failed_only=False)
 
-    models = registry.get_canonical_models()
+    canonical_models = registry.get_canonical_models()
+    groups = get_model_groups(cfg, canonical_models)
     dispatcher = Dispatcher(
-        registry, client, models,
+        registry, client, groups,
         max_queue_size=cfg.max_queue_size,
         backend_timeout=cfg.backend_timeout,
         log_writer=log_writer,
     )
 
-    dispatch_tasks = [asyncio.create_task(dispatcher.run_for_model(m)) for m in models]
+    dispatch_tasks = [
+        asyncio.create_task(dispatcher.run_for_model(k)) for k in dispatcher.queue_keys
+    ]
     health_task = asyncio.create_task(run_health_checks(registry, client))
     log_task = asyncio.create_task(log_writer.run())
 
@@ -99,8 +108,10 @@ app = FastAPI(title="Aggregate Server", version="0.1.0", lifespan=lifespan)
 
 @app.get("/v1/models")
 async def list_models(request: Request) -> JSONResponse:
+    cfg: AppConfig = request.app.state.config
     registry: BackendRegistry = request.app.state.registry
-    models = [ModelObject(id=m) for m in sorted(registry.get_canonical_models())]
+    callable_names = get_callable_models(cfg, registry.get_canonical_models())
+    models = [ModelObject(id=m) for m in callable_names]
     return JSONResponse(ModelsResponse(data=models).model_dump())
 
 
@@ -117,13 +128,13 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     request_id = str(uuid.uuid4())
     stream = bool(body.get("stream", False))
     inbound_model: str = body.get("model", "")
-    canonical = resolve_model(cfg, inbound_model)
+    canonical_models = resolve_model(cfg, inbound_model)
 
     if not registry.has_backends_for_models(canonical_models):
-        available = sorted(registry.get_canonical_models())
+        available = get_callable_models(cfg, registry.get_canonical_models())
         if not stream:
             _emit_router_record(
-                log_writer, request_id, timestamp, inbound_model, canonical,
+                log_writer, request_id, timestamp, inbound_model, canonical_models[0],
                 enqueue_at, 404, f"model '{inbound_model}' not found",
             )
         return _error_response(
@@ -135,7 +146,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
 
     future: asyncio.Future[ForwardResult] = asyncio.get_running_loop().create_future()
     pending = PendingRequest(
-        canonical_model=canonical,
+        canonical_models=canonical_models,
         body=body,
         stream=stream,
         result_future=future,
@@ -152,7 +163,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         future.cancel()
         if not stream:
             _emit_router_record(
-                log_writer, request_id, timestamp, inbound_model, canonical,
+                log_writer, request_id, timestamp, inbound_model, canonical_models[0],
                 enqueue_at, 504, "request timed out waiting for a free backend",
             )
         return _error_response(
@@ -161,7 +172,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     except QueueFullError as exc:
         if not stream:
             _emit_router_record(
-                log_writer, request_id, timestamp, inbound_model, canonical,
+                log_writer, request_id, timestamp, inbound_model, canonical_models[0],
                 enqueue_at, 503, str(exc),
             )
         return _error_response(str(exc), "rate_limit_exceeded", 503)

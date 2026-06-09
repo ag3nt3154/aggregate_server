@@ -95,15 +95,21 @@ def test_alias_resolved_before_routing() -> None:
     assert sent["model"] == "qwen3.5"
 
 
-def test_list_models() -> None:
+def test_list_models_returns_aliases_not_canonicals() -> None:
+    """
+    /v1/models should return alias keys + un-aliased canonicals.
+    Canonical models that are alias targets must not appear directly.
+    """
     with patch("aggregate_server.router.load_config") as mock_load, \
          patch("aggregate_server.health.check_all", new_callable=AsyncMock):
         from aggregate_server.config import AppConfig, BackendConfig
         mock_load.return_value = AppConfig(
             backends=[
-                BackendConfig(id="b1", url="http://b1:8080", api_key="k", model="qwen3.5"),
-                BackendConfig(id="b2", url="http://b2:8080", api_key="k", model="llama3"),
+                BackendConfig(id="b1", url="http://b1:8080", api_key="k", model="qwen3.5-9b"),
+                BackendConfig(id="b2", url="http://b2:8080", api_key="k", model="qwen3.5-9b-q8"),
+                BackendConfig(id="b3", url="http://b3:8080", api_key="k", model="llama3"),
             ],
+            model_aliases={"qwen3.5": ["qwen3.5-9b", "qwen3.5-9b-q8"]},
             queue_timeout=5.0, backend_timeout=10.0, max_queue_size=10,
         )
         with TestClient(app) as client:
@@ -113,3 +119,33 @@ def test_list_models() -> None:
     ids = [m["id"] for m in resp.json()["data"]]
     assert "qwen3.5" in ids
     assert "llama3" in ids
+    assert "qwen3.5-9b" not in ids
+    assert "qwen3.5-9b-q8" not in ids
+
+
+@respx.mock
+def test_multi_model_alias_routes_to_any_backend() -> None:
+    """A request using a multi-model alias reaches one of the alias's target backends."""
+    route_9b = respx.post("http://b1:8080/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=RESPONSE_JSON)
+    )
+    route_q8 = respx.post("http://b2:8080/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=RESPONSE_JSON)
+    )
+    with patch("aggregate_server.router.load_config") as mock_load, \
+         patch("aggregate_server.health.check_all", new_callable=AsyncMock):
+        from aggregate_server.config import AppConfig, BackendConfig
+        mock_load.return_value = AppConfig(
+            backends=[
+                BackendConfig(id="b1", url="http://b1:8080", api_key="k", model="qwen3.5-9b"),
+                BackendConfig(id="b2", url="http://b2:8080", api_key="k", model="qwen3.5-9b-q8"),
+            ],
+            model_aliases={"qwen3.5": ["qwen3.5-9b", "qwen3.5-9b-q8"]},
+            queue_timeout=5.0, backend_timeout=10.0, max_queue_size=10,
+        )
+        with TestClient(app) as client:
+            resp = client.post("/v1/chat/completions",
+                               json={"model": "qwen3.5", "messages": []})
+
+    assert resp.status_code == 200
+    assert route_9b.called or route_q8.called
