@@ -14,21 +14,21 @@ Exit codes:
 from __future__ import annotations
 
 import asyncio
-import os
-import sys
-import tempfile
+import os  # noqa: F401
+import sys  # noqa: F401
+import tempfile  # noqa: F401
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-import httpx
-import uvicorn
-import yaml
+import httpx  # noqa: F401
+import uvicorn  # noqa: F401
+import yaml  # noqa: F401
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-FAKE_BACKENDS: list[dict] = [
+FAKE_BACKENDS: list[dict[str, object]] = [
     {"id": "backend_1", "port": 9001, "latency": 0.5},
     {"id": "backend_2", "port": 9002, "latency": 1.0},
     {"id": "backend_3", "port": 9003, "latency": 2.0},
@@ -54,12 +54,13 @@ def make_fake_backend(backend_id: str, latency: float) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def completions(request: Request) -> JSONResponse:
         body = await request.json()
+        model: str = body.get("model", "")
         received = time.monotonic()
         await asyncio.sleep(latency)
         responded = time.monotonic()
         requests_log.append(
             RequestRecord(
-                model=body.get("model", ""),
+                model=model,
                 received_at=received,
                 responded_at=responded,
             )
@@ -69,7 +70,7 @@ def make_fake_backend(backend_id: str, latency: float) -> FastAPI:
                 "id": "chatcmpl-fake",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": body.get("model", ""),
+                "model": model,
                 "choices": [
                     {
                         "index": 0,
