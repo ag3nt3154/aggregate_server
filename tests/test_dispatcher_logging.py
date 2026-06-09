@@ -1,4 +1,3 @@
-# tests/test_dispatcher_logging.py
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from aggregate_server.config import AppConfig
+from aggregate_server.config import AppConfig, get_model_groups
 from aggregate_server.dispatcher import Dispatcher, PendingRequest
 from aggregate_server.forwarder import ForwardError, ForwardResult
 from aggregate_server.log_writer import LogRecord, LogWriter
@@ -35,9 +34,9 @@ def _make_dispatcher(
     cfg: AppConfig, client: httpx.AsyncClient, writer: LogWriter
 ) -> tuple[Dispatcher, BackendRegistry]:
     registry = BackendRegistry(cfg.backends)
-    models = registry.get_canonical_models()
+    groups = get_model_groups(cfg, registry.get_canonical_models())
     dispatcher = Dispatcher(
-        registry, client, models,
+        registry, client, groups,
         max_queue_size=cfg.max_queue_size,
         backend_timeout=cfg.backend_timeout,
         log_writer=writer,
@@ -59,7 +58,7 @@ async def test_log_writer_called_on_success(sample_config: AppConfig) -> None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ForwardResult] = loop.create_future()
         pending = PendingRequest(
-            "qwen3.5", BODY, False, future,
+            ["qwen3.5"], BODY, False, future,
             request_id="req-x", timestamp=time.time(),
             inbound_model="qwen3.5", enqueue_at=time.monotonic(),
         )
@@ -92,7 +91,7 @@ async def test_log_writer_called_on_all_backends_fail(sample_config: AppConfig) 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ForwardResult] = loop.create_future()
         pending = PendingRequest(
-            "qwen3.5", BODY, False, future,
+            ["qwen3.5"], BODY, False, future,
             request_id="req-err", timestamp=time.time(),
             inbound_model="qwen3.5", enqueue_at=time.monotonic(),
         )
@@ -116,12 +115,11 @@ async def test_streaming_request_not_logged(sample_config: AppConfig) -> None:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ForwardResult] = loop.create_future()
         future.cancel()
-        # stream=True — even if it had been dispatched, it would not be logged
         pending = PendingRequest(
-            "qwen3.5", BODY, True, future,
+            ["qwen3.5"], BODY, True, future,
             request_id="stream-req", timestamp=time.time(),
             inbound_model="qwen3.5", enqueue_at=time.monotonic(),
         )
-        _ = pending  # not dispatched — just verify no logs accumulated
+        _ = pending
 
     assert len(writer.records) == 0

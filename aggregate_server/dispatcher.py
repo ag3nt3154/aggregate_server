@@ -20,14 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 class QueueFullError(Exception):
-    def __init__(self, model: str, max_size: int) -> None:
-        super().__init__(f"Queue full for model '{model}' (capacity {max_size})")
+    def __init__(self, queue_key: str, max_size: int) -> None:
+        super().__init__(f"Queue full for model '{queue_key}' (capacity {max_size})")
         self.status_code = 503
 
 
 @dataclass
 class PendingRequest:
-    canonical_model: str
+    canonical_models: list[str]
     body: dict[str, Any]
     stream: bool
     result_future: asyncio.Future[ForwardResult]
@@ -39,15 +39,15 @@ class PendingRequest:
 
 class Dispatcher:
     """
-    Manages per-model request queues and dispatches requests to free backends.
-    One run_for_model() coroutine must be running per canonical model.
+    Manages per-model-group request queues and dispatches requests to free backends.
+    One run_for_model() coroutine must be running per queue key.
     """
 
     def __init__(
         self,
         registry: BackendRegistry,
         client: httpx.AsyncClient,
-        canonical_models: list[str],
+        canonical_model_groups: list[list[str]],
         *,
         max_queue_size: int = 100,
         backend_timeout: float = 300.0,
@@ -61,34 +61,45 @@ class Dispatcher:
         self._poll_interval = poll_interval
         self._log_writer = log_writer
         self._queues: dict[str, asyncio.Queue[PendingRequest]] = {
-            m: asyncio.Queue() for m in canonical_models
+            self._key(g): asyncio.Queue() for g in canonical_model_groups
         }
 
+    @staticmethod
+    def _key(canonical_models: list[str]) -> str:
+        return ",".join(sorted(canonical_models))
+
+    @property
+    def queue_keys(self) -> list[str]:
+        return list(self._queues.keys())
+
     def enqueue(self, pending: PendingRequest) -> None:
-        queue = self._queues.get(pending.canonical_model)
+        key = self._key(pending.canonical_models)
+        queue = self._queues.get(key)
         if queue is None:
             pending.result_future.set_exception(
-                ForwardError(f"No backends configured for model '{pending.canonical_model}'", 404)
+                ForwardError(
+                    f"No backends configured for model '{key}'", 404
+                )
             )
             return
         if queue.qsize() >= self._max_queue_size:
             pending.result_future.set_exception(
-                QueueFullError(pending.canonical_model, self._max_queue_size)
+                QueueFullError(key, self._max_queue_size)
             )
             return
         queue.put_nowait(pending)
 
-    async def run_for_model(self, canonical_model: str) -> None:
+    async def run_for_model(self, queue_key: str) -> None:
         """Long-running loop: dequeue requests and dispatch them to free backends."""
-        queue = self._queues[canonical_model]
+        queue = self._queues[queue_key]
         while True:
             pending = await queue.get()
-            entry = await self._acquire_with_poll(canonical_model)
+            entry = await self._acquire_with_poll(pending.canonical_models)
             asyncio.create_task(self._handle_request(entry, pending))
 
-    async def _acquire_with_poll(self, canonical_model: str) -> BackendEntry:
+    async def _acquire_with_poll(self, canonical_models: list[str]) -> BackendEntry:
         while True:
-            entry = await self._registry.acquire_backend(canonical_model)
+            entry = await self._registry.acquire_backend(canonical_models)
             if entry is not None:
                 return entry
             await asyncio.sleep(self._poll_interval)
@@ -115,11 +126,10 @@ class Dispatcher:
             except ForwardError as exc:
                 logger.warning("Backend %s failed: %s", current.config.id, exc)
                 await self._registry.release_backend(current, failed=True)
-                current = await self._next_untried_backend(pending.canonical_model, tried_ids)
+                current = await self._next_untried_backend(pending.canonical_models, tried_ids)
 
-        err = ForwardError(
-            f"All backends for model '{pending.canonical_model}' exhausted", 502
-        )
+        label = ",".join(pending.canonical_models)
+        err = ForwardError(f"All backends for model group '{label}' exhausted", 502)
         if not pending.result_future.done():
             pending.result_future.set_exception(err)
         if not pending.stream and self._log_writer is not None:
@@ -144,7 +154,7 @@ class Dispatcher:
             request_id=pending.request_id,
             timestamp=pending.timestamp,
             inbound_model=pending.inbound_model,
-            canonical_model=pending.canonical_model,
+            canonical_model=entry.config.model,
             backend_id=entry.config.id,
             status_code=200,
             queue_time_ms=queue_ms,
@@ -169,7 +179,7 @@ class Dispatcher:
             request_id=pending.request_id,
             timestamp=pending.timestamp,
             inbound_model=pending.inbound_model,
-            canonical_model=pending.canonical_model,
+            canonical_model=pending.canonical_models[0],
             backend_id=None,
             status_code=status_code,
             queue_time_ms=queue_ms,
@@ -192,9 +202,9 @@ class Dispatcher:
             await self._registry.release_backend(entry, failed=False)
 
     async def _next_untried_backend(
-        self, model: str, tried_ids: set[str]
+        self, canonical_models: list[str], tried_ids: set[str]
     ) -> BackendEntry | None:
-        entry = await self._registry.acquire_backend(model)
+        entry = await self._registry.acquire_backend(canonical_models)
         if entry is None:
             return None
         if entry.config.id in tried_ids:
