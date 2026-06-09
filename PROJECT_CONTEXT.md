@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-> Last updated: 2026-06-09 (rev 5) | [README](README.md)
+> Last updated: 2026-06-09 (rev 6) | [README](README.md)
 
 ---
 
@@ -102,7 +102,7 @@ Dashboard (standalone, no aggregate_server imports):
 | `aggregate_server/router.py` | FastAPI app, lifespan wiring, `/v1/chat/completions`, `/v1/models` |
 | `aggregate_server/config.py` | YAML load + Pydantic v2 validation; `resolve_model()` → `list[str]`; `get_callable_models()`; `get_model_groups()` |
 | `aggregate_server/log_writer.py` | `LogRecord` dataclass + `LogWriter` (queue → daily SQLite files) |
-| `config.yaml` | Backend definitions, model aliases, timeout/queue tuning (not committed with secrets) |
+| `config.yaml` | Backend definitions, model aliases, timeout/queue tuning. Updated 2026-06-09 to show multi-model alias (`qwen3.5 → [qwen3.5-9b, qwen3.5-9b-q8]`) and distinct canonical IDs per backend. |
 | `dashboard/data.py` | `load_data(db_dir, days)` → pd.DataFrame from daily .db files (**implemented**) |
 | `dashboard/regression.py` | `fit_response_model(df)` → `RegressionResult` via numpy lstsq (**implemented**) |
 | `dashboard/charts.py` | Altair chart helpers: request count, tokens, error rate (**implemented**) |
@@ -246,6 +246,11 @@ Dashboard (standalone, no aggregate_server imports):
   (needs `# type: ignore[return-value]`) while a single-chain `alt.Chart(...).properties()` returns `Any`
   (needs `# type: ignore[no-any-return]`). Using the wrong code produces both the original error and
   a bonus `[unused-ignore]` error, making the problem appear doubled.
+- **mypy overrides required for dashboard deps**: `pandas` and `streamlit_autorefresh` ship no type
+  stubs, so `strict = true` in `[tool.mypy]` causes `[import-untyped]` errors for all dashboard
+  files. The fix is `[[tool.mypy.overrides]]` with `ignore_missing_imports = true` scoped to those
+  module patterns. Do not broaden this to a global `ignore_missing_imports` — that would silently
+  hide genuinely missing stubs in `aggregate_server/`.
 - **`fit_response_model` uses unconstrained OLS**: numpy `lstsq` can return negative coefficients
   (e.g. negative `latency_ms`) if the data is ill-conditioned or too homogeneous. Dashboard
   display code should guard for negative values before presenting them as physical estimates.
@@ -315,6 +320,10 @@ Dashboard (standalone, no aggregate_server imports):
   Deliberately accepts known test failures between tasks and documents them explicitly in
   PROJECT_CONTEXT.md. Future sessions should not treat mid-plan breakage as bugs to fix out of scope;
   always check the plan stage before diagnosing failures.
+- Final verification tasks (Task 5 pattern) include full pytest + ruff + mypy passes before commit.
+  These consistently surface at least one issue not caught mid-implementation — in this session,
+  mypy `import-untyped` errors for dashboard third-party deps. Expect and budget for small fixup
+  work in every final verification pass.
 
 ### Project Shortcomings
 
@@ -361,6 +370,15 @@ Dashboard (standalone, no aggregate_server imports):
   use a `mode="before"` class-method validator so the narrowed type is reflected in the annotation
   and mypy can verify downstream callers. This pattern was applied to `model_aliases` in `config.py`
   on 2026-06-09.
+
+- **2026-06-09 Error**: mypy `import-untyped` errors for `pandas` and `streamlit_autorefresh` on
+  `mypy aggregate_server/ dashboard/`.
+  **Cause**: `pyproject.toml` used `[tool.mypy] strict = true` with no per-module overrides for
+  third-party packages that ship no type stubs (`pandas`, `streamlit_autorefresh`). Strict mode
+  reports `[import-untyped]` for these packages unless explicitly silenced.
+  **Fix**: Added `[[tool.mypy.overrides]]` section with `module = ["pandas", "pandas.*",
+  "streamlit_autorefresh"]` and `ignore_missing_imports = true`. Installing `pandas-stubs` would
+  be a more complete alternative but adds a dev dependency.
 
 - **2026-06-09 Error**: `TypeError: unhashable type: 'list'` in `Dispatcher.__init__` when building
   the `_queues` dict after Task 3 tests were written but before the dispatcher was updated.
