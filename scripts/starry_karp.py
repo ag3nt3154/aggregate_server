@@ -45,6 +45,7 @@ FAKE_BACKENDS: list[_BackendSpec] = [
 ]
 AGG_PORT = 8765
 RETRY_BACKEND: _BackendSpec = {"id": "backend_5", "port": 9005, "latency": 0.0}
+RETRY_ERROR_LATENCY = 5.0  # seconds backend_5 sleeps before returning an error
 
 # ── FakeBackend ───────────────────────────────────────────────────────────────
 
@@ -220,8 +221,8 @@ def write_phase3_config(path: str) -> None:
     """backend_5 (flaky) + backend_1 (healthy), both serving 'retry-model'."""
     cfg = {
         "backends": [
-            _backend_entry(RETRY_BACKEND["id"], int(RETRY_BACKEND["port"]), "retry-model"),
-            _backend_entry(FAKE_BACKENDS[0]["id"], int(FAKE_BACKENDS[0]["port"]), "retry-model"),
+            _backend_entry(RETRY_BACKEND["id"], RETRY_BACKEND["port"], "retry-model"),
+            _backend_entry(FAKE_BACKENDS[0]["id"], FAKE_BACKENDS[0]["port"], "retry-model"),
         ],
         "queue_timeout": 30,
         "backend_timeout": 60,
@@ -427,11 +428,11 @@ def verify_phase3(
     healthy_hits = int(stats[FAKE_BACKENDS[0]["id"]]["hit_count"])  # type: ignore[arg-type]
     checks.append(AssertionResult(
         healthy_hits >= 1,
-        f"Healthy backend (backend_1) handled the rerouted request (hits: {healthy_hits})",
+        f"Healthy backend (backend_1) received at least one request (hits: {healthy_hits})",
     ))
     checks.append(AssertionResult(
-        elapsed > 5.0,
-        f"Elapsed {elapsed:.1f}s > 5s — confirms retry delay was incurred",
+        elapsed > RETRY_ERROR_LATENCY,
+        f"Elapsed {elapsed:.1f}s > {RETRY_ERROR_LATENCY}s — confirms error_latency was incurred",
     ))
     return checks
 
@@ -511,7 +512,7 @@ async def _start_fake_backends() -> list[tuple[uvicorn.Server, asyncio.Task[None
         servers.append((server, task))
     retry_app = make_fake_backend(
         RETRY_BACKEND["id"], RETRY_BACKEND["latency"],
-        fail_after=1, error_latency=5.0,
+        fail_after=1, error_latency=RETRY_ERROR_LATENCY,
     )
     server, task = await start_server(retry_app, int(RETRY_BACKEND["port"]))
     servers.append((server, task))

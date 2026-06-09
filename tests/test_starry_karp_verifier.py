@@ -129,6 +129,7 @@ def test_phase3_all_pass() -> None:
 
 
 def test_phase3_fails_when_no_200() -> None:
+    # Also triggers the healthy-hits check (backend_1=0), but we only assert on 200.
     results = [RequestResult(status_code=502, body={})]
     stats = {
         "backend_5": make_stats("backend_5", 2, ["retry-model"] * 2),
@@ -155,4 +156,4 @@ def test_phase3_fails_when_elapsed_too_short() -> None:
         "backend_1": make_stats("backend_1", 1, ["retry-model"]),
     }
     checks = verify_phase3(results, stats, elapsed=3.0)
-    assert any(not c.passed and "5s" in c.message for c in checks)
+    assert any(not c.passed and "error_latency" in c.message for c in checks)
