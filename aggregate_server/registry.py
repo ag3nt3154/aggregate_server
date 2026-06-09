@@ -25,20 +25,20 @@ class BackendRegistry:
     """
     Async-safe registry tracking the state of all backend endpoints.
 
-    Round-robin selection is implemented by picking the FREE backend with the
-    smallest last_used_at (monotonic time), i.e. the one that was idle longest.
+    Round-robin selection picks the FREE backend with the smallest last_used_at
+    (monotonic time) across all supplied canonical model names.
     """
 
     def __init__(self, configs: list[BackendConfig]) -> None:
         self._entries: list[BackendEntry] = [BackendEntry(config=c) for c in configs]
         self._lock = asyncio.Lock()
 
-    async def acquire_backend(self, canonical_model: str) -> BackendEntry | None:
-        """Atomically claim the longest-idle FREE backend for the given model, or None."""
+    async def acquire_backend(self, canonical_models: list[str]) -> BackendEntry | None:
+        """Atomically claim the longest-idle FREE backend for any of the given models."""
         async with self._lock:
             candidates = [
                 e for e in self._entries
-                if e.state == BackendState.FREE and e.config.model == canonical_model
+                if e.state == BackendState.FREE and e.config.model in canonical_models
             ]
             if not candidates:
                 return None
@@ -68,6 +68,6 @@ class BackendRegistry:
         """Return the set of canonical model names across all configured backends."""
         return list({e.config.model for e in self._entries})
 
-    def has_backends_for_model(self, canonical_model: str) -> bool:
-        """Check (without locking) whether any backend is configured for this model."""
-        return any(e.config.model == canonical_model for e in self._entries)
+    def has_backends_for_models(self, canonical_models: list[str]) -> bool:
+        """Check (without locking) whether any backend is configured for any of these models."""
+        return any(e.config.model in canonical_models for e in self._entries)
