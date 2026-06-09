@@ -19,6 +19,7 @@ import sys  # noqa: F401
 import tempfile  # noqa: F401
 import time
 from dataclasses import dataclass
+from typing import TypedDict
 
 import httpx
 import uvicorn
@@ -28,7 +29,14 @@ from fastapi.responses import JSONResponse
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-FAKE_BACKENDS: list[dict[str, object]] = [
+
+class _BackendSpec(TypedDict):
+    id: str
+    port: int
+    latency: float
+
+
+FAKE_BACKENDS: list[_BackendSpec] = [
     {"id": "backend_1", "port": 9001, "latency": 0.5},
     {"id": "backend_2", "port": 9002, "latency": 1.0},
     {"id": "backend_3", "port": 9003, "latency": 2.0},
@@ -137,7 +145,12 @@ async def start_server(
     )
     server = uvicorn.Server(config)
     task: asyncio.Task[None] = asyncio.create_task(server.serve())
-    await wait_for_port("127.0.0.1", port)
+    try:
+        await wait_for_port("127.0.0.1", port)
+    except Exception:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
     return server, task
 
 
