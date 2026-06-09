@@ -119,7 +119,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     inbound_model: str = body.get("model", "")
     canonical = resolve_model(cfg, inbound_model)
 
-    if not registry.has_backends_for_model(canonical):
+    if not registry.has_backends_for_models(canonical_models):
         available = sorted(registry.get_canonical_models())
         if not stream:
             _emit_router_record(
