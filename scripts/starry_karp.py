@@ -461,6 +461,7 @@ async def _run_phase(
 
 
 async def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print("Starting fake backends...")
     backend_servers = await _start_fake_backends()
     print("  All 4 backends ready.\n")
