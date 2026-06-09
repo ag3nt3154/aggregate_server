@@ -273,3 +273,86 @@ async def run_phase2(client: httpx.AsyncClient) -> list[RequestResult]:
         results.extend(await send_wave(client, model, 5))
         await asyncio.sleep(0.5)
     return results
+
+
+# ── Verifier ──────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class AssertionResult:
+    passed: bool
+    message: str
+
+
+def verify_phase1(
+    results: list[RequestResult],
+    stats: dict[str, dict[str, object]],
+    elapsed: float,
+) -> list[AssertionResult]:
+    """Run Phase 1 assertions: all 200s, all backends hit, faster > slower."""
+    checks: list[AssertionResult] = []
+    failed = [r.status_code for r in results if r.status_code != 200]
+    checks.append(AssertionResult(
+        not failed,
+        f"All 20 requests returned 200 (non-200 codes: {failed})",
+    ))
+    all_hit = all(stats[b["id"]]["hit_count"] > 0 for b in FAKE_BACKENDS)
+    hit_counts = {b["id"]: stats[b["id"]]["hit_count"] for b in FAKE_BACKENDS}
+    checks.append(AssertionResult(
+        all_hit,
+        f"All 4 backends received traffic (counts: {hit_counts})",
+    ))
+    b1 = stats["backend_1"]["hit_count"]
+    b4 = stats["backend_4"]["hit_count"]
+    checks.append(AssertionResult(
+        b1 > b4,  # type: ignore[operator]
+        f"backend_1 ({b1} hits) > backend_4 ({b4} hits) — faster backend serves more",
+    ))
+    total = sum(int(stats[b["id"]]["hit_count"]) for b in FAKE_BACKENDS)  # type: ignore[arg-type]
+    checks.append(AssertionResult(
+        total == 20,
+        f"Total hits across all backends = 20 (got {total})",
+    ))
+    checks.append(AssertionResult(
+        elapsed < 60.0,
+        f"Elapsed {elapsed:.1f}s < 60s serialised ceiling (proves concurrency)",
+    ))
+    return checks
+
+
+def verify_phase2(
+    results: list[RequestResult],
+    stats: dict[str, dict[str, object]],
+) -> list[AssertionResult]:
+    """Run Phase 2 assertions: all 200s, per-model queue isolation holds."""
+    checks: list[AssertionResult] = []
+    failed = [r.status_code for r in results if r.status_code != 200]
+    checks.append(AssertionResult(
+        not failed,
+        f"All 20 requests returned 200 (non-200 codes: {failed})",
+    ))
+    a_hits = int(stats["backend_1"]["hit_count"]) + int(stats["backend_2"]["hit_count"])  # type: ignore[arg-type]
+    b_hits = int(stats["backend_3"]["hit_count"]) + int(stats["backend_4"]["hit_count"])  # type: ignore[arg-type]
+    checks.append(AssertionResult(
+        a_hits == 10,
+        f"model-a backends (1+2) combined = 10 hits (got {a_hits})",
+    ))
+    checks.append(AssertionResult(
+        b_hits == 10,
+        f"model-b backends (3+4) combined = 10 hits (got {b_hits})",
+    ))
+    b3_reqs = stats["backend_3"]["requests"]
+    b4_reqs = stats["backend_4"]["requests"]
+    b12_reqs = list(stats["backend_1"]["requests"]) + list(stats["backend_2"]["requests"])  # type: ignore[operator]
+    b3_models = {r["model"] for r in b3_reqs} if isinstance(b3_reqs, list) else set()  # type: ignore[union-attr]
+    b4_models = {r["model"] for r in b4_reqs} if isinstance(b4_reqs, list) else set()  # type: ignore[union-attr]
+    b12_models = {r["model"] for r in b12_reqs}  # type: ignore[index]
+    checks.append(AssertionResult(
+        b3_models <= {"model-b"} and b4_models <= {"model-b"},
+        f"model-a traffic never reached backend_3/4 (b3: {b3_models}, b4: {b4_models})",
+    ))
+    checks.append(AssertionResult(
+        b12_models <= {"model-a"},
+        f"model-b traffic never reached backend_1/2 (b1+b2 models: {b12_models})",
+    ))
+    return checks
